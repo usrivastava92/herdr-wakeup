@@ -4,6 +4,10 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$DIR/lib.sh"
+# Best-effort: stop must still be able to find and kill a running watcher
+# (falling back to the shared state dir, see lib.sh's _load_paths) even if
+# binary resolution itself fails.
+resolve_bins || true
 
 if pid="$(watcher_pid)"; then
   kill -TERM "$pid" 2>/dev/null || true

@@ -42,3 +42,9 @@ id = "disarm"
 title = "Wakeup: disarm"
 contexts = ["global", "workspace", "pane"]
 command = ["bash", "bin/disarm"]
+
+[[actions]]
+id = "doctor"
+title = "Wakeup: doctor"
+contexts = ["global", "workspace", "pane"]
+command = ["bash", "bin/doctor"]

@@ -36,6 +36,7 @@ herdr plugin action invoke start   --plugin herdr-wakeup
 herdr plugin action invoke status  --plugin herdr-wakeup
 herdr plugin action invoke arm     --plugin herdr-wakeup   # resume wake/sleep decisions
 herdr plugin action invoke disarm  --plugin herdr-wakeup   # pause without stopping the watcher
+herdr plugin action invoke doctor  --plugin herdr-wakeup   # diagnostics: binaries, socket, config/state, pidfile
 herdr plugin action invoke stop    --plugin herdr-wakeup
 ```
 
@@ -88,10 +89,12 @@ While a snapshot fetch fails (`Error`), the watcher holds whatever it was alread
 
 | File | Location | Purpose |
 | --- | --- | --- |
-| `config.json` | `$HERDR_PLUGIN_CONFIG_DIR` (or `~/.config/herdr-wakeup` standalone) | `armed`, `display`, `start_grace_seconds`, `stop_grace_seconds`, `statuses`, `notify`, binary paths, `allow_cli_fallback`. Seeds defaults *underneath* CLI flags; CLI flags always win. |
-| `state.json` | `$HERDR_PLUGIN_STATE_DIR` (or `~/.local/state/herdr-wakeup` standalone) | Current state, `armed`, whether the assertion is held, working agents, last transition, last error. Written after every evaluation; never read back by the watcher itself. |
+| `config.json` | `$HERDR_PLUGIN_CONFIG_DIR/sessions/<key>` (or `~/.config/herdr-wakeup/sessions/<key>` standalone) | `armed`, `display`, `start_grace_seconds`, `stop_grace_seconds`, `statuses`, `notify`, binary paths, `allow_cli_fallback`. Seeds defaults *underneath* CLI flags; CLI flags always win. |
+| `state.json` | `$HERDR_PLUGIN_STATE_DIR/sessions/<key>` (or `~/.local/state/herdr-wakeup/sessions/<key>` standalone) | Current state, `armed`, whether the assertion is held, working agents, last transition, `checked_at_unix` (for staleness detection), last error. Written after every evaluation; never read back by the watcher itself. |
 
 Both are written atomically (temp file + rename), and a missing or corrupt file always falls back safely to defaults rather than crashing or blocking startup - a corrupt config is logged once and defaults to armed.
+
+`<key>` is a short hash derived from the resolved Herdr socket path (Herdr does not expose a session name to plugin action scripts), so concurrent Herdr sessions never share one watcher's config/state/pidfile/log. Run `wakeup-herdr paths` to see the resolved directories and key for the current socket.
 
 `armed` is re-read from config on every evaluation, not just at startup, so:
 
@@ -99,9 +102,17 @@ Both are written atomically (temp file + rename), and a missing or corrupt file 
 wakeup-herdr disarm   # pause: release any held assertion immediately, keep observing
 wakeup-herdr arm      # resume normal wake/sleep decisions
 wakeup-herdr state    # print the last-persisted runtime state (no running watcher needed)
+wakeup-herdr doctor   # one-shot diagnostic dump: socket reachability, config/state validity, pidfile identity
+wakeup-herdr paths    # print the resolved, session-scoped config/state directories
 ```
 
 `disarm`/`arm` just flip and atomically save `config.json` - they work whether or not the watcher is running (so `disarm` survives a restart), and an already-running watcher picks up the change on its very next evaluation without a restart or signal.
+
+## Lifecycle hardening
+
+- **Pidfile identity validation**: the pidfile records `pid`, `bin`, `session`, and `started_at`. Before trusting it, the plugin scripts confirm the PID is alive *and* its running command matches the recorded binary - so a stale pidfile left behind after a crash, or a PID later reused by an unrelated process, is never mistaken for a live watcher. `start` is idempotent (a second `start` while one is already running is a no-op) and `stop` never kills an unrelated process.
+- **Dead-child recovery**: if the spawned `wakeup` child exits unexpectedly (e.g. killed out-of-band) while the state machine still believes it should be holding the assertion, the watcher notices on its next evaluation and respawns it automatically.
+- **`doctor`**: a single command/action that reports binary resolution, socket reachability, config/state file validity, the session key, and whether the pidfile's recorded PID is actually alive - meant to be the first thing to run when something seems wrong.
 
 ## Improvement plan
 

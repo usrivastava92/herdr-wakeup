@@ -24,16 +24,51 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// The Herdr socket path, resolved the same way `Opts`'s own default is
+/// (`HERDR_SOCKET_PATH` env var, else the standard default) - deliberately
+/// *not* including any `--socket` CLI override, so config/state loading
+/// (which happens before CLI args are parsed) and the running watcher always
+/// agree on the same session-scoped directory. Used only to derive
+/// `session_key`, never to actually connect.
+pub fn socket_hint() -> String {
+    std::env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| {
+        home_dir()
+            .join(".config/herdr/herdr.sock")
+            .display()
+            .to_string()
+    })
+}
+
+/// Derive a short, filesystem-safe key that uniquely identifies which Herdr
+/// server/session this watcher is bound to (Milestone 5, item 5: concurrent
+/// Herdr sessions must not share one config/state/pidfile/log set).
+///
+/// Herdr does not expose a session name to plugin action scripts (verified
+/// empirically - only `HERDR_SOCKET_PATH` and similar are injected), so the
+/// key is derived from the resolved socket path itself via FNV-1a: cheap,
+/// dependency-free, and more than collision-resistant enough for a handful
+/// of concurrent local sessions (this is not adversarial input).
+pub fn session_key(socket_path: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in socket_path.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 pub fn config_dir() -> PathBuf {
-    std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
+    let base = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".config/herdr-wakeup"))
+        .unwrap_or_else(|| home_dir().join(".config/herdr-wakeup"));
+    base.join("sessions").join(session_key(&socket_hint()))
 }
 
 pub fn state_dir() -> PathBuf {
-    std::env::var_os("HERDR_PLUGIN_STATE_DIR")
+    let base = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".local/state/herdr-wakeup"))
+        .unwrap_or_else(|| home_dir().join(".local/state/herdr-wakeup"));
+    base.join("sessions").join(session_key(&socket_hint()))
 }
 
 pub fn config_path() -> PathBuf {
@@ -202,6 +237,15 @@ pub struct RuntimeState {
     pub agent_count: usize,
     pub last_transition_unix: u64,
     pub last_error: Option<String>,
+    /// Wall-clock time this file was last written, updated on *every*
+    /// evaluation (unlike `last_transition_unix`, which only updates on an
+    /// Acquire/Release). Lets `status`/`doctor` detect a stuck or crashed
+    /// watcher: if this is old but the pidfile claims the watcher is
+    /// running, something is wrong (Milestone 5: "status identifies stale
+    /// watcher state").
+    pub checked_at_unix: u64,
+    /// The session key this state belongs to, echoed for `doctor` display.
+    pub session_key: String,
 }
 
 impl RuntimeState {
@@ -215,6 +259,8 @@ impl RuntimeState {
             "agent_count": self.agent_count,
             "last_transition_unix": self.last_transition_unix,
             "last_error": self.last_error,
+            "checked_at_unix": self.checked_at_unix,
+            "session_key": self.session_key,
         })
     }
 
@@ -245,6 +291,15 @@ impl RuntimeState {
                 .get("last_error")
                 .and_then(|e| e.as_str())
                 .map(str::to_string),
+            checked_at_unix: v
+                .get("checked_at_unix")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            session_key: v
+                .get("session_key")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
+                .to_string(),
         })
     }
 
@@ -303,6 +358,42 @@ mod tests {
                 .unwrap()
                 .as_nanos(),
         ))
+    }
+
+    #[test]
+    fn session_key_is_deterministic_and_distinguishes_sockets() {
+        let a = session_key("/Users/alice/.config/herdr/herdr.sock");
+        let b = session_key("/Users/alice/.config/herdr/herdr.sock");
+        let c = session_key("/Users/alice/.config/herdr/work-session.sock");
+        assert_eq!(a, b, "same socket path must hash to the same key");
+        assert_ne!(
+            a, c,
+            "different socket paths (different sessions) must hash differently"
+        );
+        // Filesystem-safe: only lowercase hex digits, fixed length.
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn config_dir_and_state_dir_are_session_scoped() {
+        // SAFETY: tests in this module run single-threaded enough for this
+        // narrow env-var scope (no other test reads these two vars), and we
+        // always restore them.
+        let prev_socket = std::env::var_os("HERDR_SOCKET_PATH");
+        std::env::set_var("HERDR_SOCKET_PATH", "/tmp/session-a.sock");
+        let dir_a = state_dir();
+        std::env::set_var("HERDR_SOCKET_PATH", "/tmp/session-b.sock");
+        let dir_b = state_dir();
+        match prev_socket {
+            Some(v) => std::env::set_var("HERDR_SOCKET_PATH", v),
+            None => std::env::remove_var("HERDR_SOCKET_PATH"),
+        }
+        assert_ne!(
+            dir_a, dir_b,
+            "different sessions must resolve to different state dirs"
+        );
+        assert!(dir_a.to_string_lossy().contains("sessions"));
     }
 
     #[test]
@@ -412,6 +503,8 @@ mod tests {
             agent_count: 3,
             last_transition_unix: 1_783_670_000,
             last_error: None,
+            checked_at_unix: 1_783_670_005,
+            session_key: "0123456789abcdef".to_string(),
         };
         rt.save(&path).unwrap();
         let (loaded, err) = RuntimeState::load(&path);

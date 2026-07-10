@@ -28,11 +28,38 @@ resolve_bins() {
   export WAKEUP_BIN="$WAKEUP"
 }
 
-# State dir for the background watcher pidfile/log.
+# Session-scoped state dir for the background watcher pidfile/log (Milestone
+# 5, item 5). Resolved via `wakeup-herdr paths` - the single source of truth
+# for the session-key hash - rather than re-deriving it in bash, so this can
+# never drift from where the watcher itself writes config.json/state.json.
+#
+# Falls back to the pre-Milestone-5 shared (non-session-scoped) location if
+# $WAKEUP_HERDR is unresolved or `paths` fails for any reason: `stop` in
+# particular must always be able to find and kill a running watcher even in
+# a broken environment, so this deliberately degrades instead of erroring.
+_load_paths() {
+  [ -n "${_HERDR_WAKEUP_STATE_DIR:-}" ] && return 0
+  local out
+  if [ -n "${WAKEUP_HERDR:-}" ] && out="$("$WAKEUP_HERDR" paths 2>/dev/null)"; then
+    eval "$out"
+    _HERDR_WAKEUP_STATE_DIR="${STATE_DIR:?}"
+    _HERDR_WAKEUP_SESSION_KEY="${SESSION_KEY:-unknown}"
+  else
+    echo "herdr-wakeup: could not resolve session-scoped paths (wakeup-herdr binary unavailable?); falling back to shared state dir" >&2
+    _HERDR_WAKEUP_STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-$HOME/.local/state/herdr-wakeup}"
+    _HERDR_WAKEUP_SESSION_KEY="unknown"
+  fi
+}
+
 state_dir() {
-  local d="${HERDR_PLUGIN_STATE_DIR:-$HOME/.local/state/herdr-wakeup}"
-  mkdir -p "$d" 2>/dev/null || true
-  printf '%s' "$d"
+  _load_paths
+  mkdir -p "$_HERDR_WAKEUP_STATE_DIR" 2>/dev/null || true
+  printf '%s' "$_HERDR_WAKEUP_STATE_DIR"
+}
+
+session_key() {
+  _load_paths
+  printf '%s' "$_HERDR_WAKEUP_SESSION_KEY"
 }
 
 pidfile() { printf '%s/watcher.pid' "$(state_dir)"; }
@@ -44,6 +71,7 @@ write_pidfile() {
   {
     printf 'pid=%s\n' "$pid"
     printf 'bin=%s\n' "$bin"
+    printf 'session=%s\n' "$(session_key)"
     printf 'started_at=%s\n' "$(date +%s 2>/dev/null || printf unknown)"
   } > "$f"
 }

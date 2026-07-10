@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Action: run diagnostics for the herdr-wakeup plugin (Milestone 5).
+#
+# Deliberately does not use `set -e`: the whole point of `doctor` is to be
+# useful precisely when something is broken, so every check here degrades to
+# a clear line of output instead of aborting partway through.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$DIR/lib.sh"
+
+echo "herdr-wakeup plugin doctor"
+echo "=========================="
+
+if resolve_bins; then
+  echo "wakeup:       $WAKEUP"
+  echo "wakeup-herdr: $WAKEUP_HERDR"
+else
+  echo "binary resolution: FAILED (see message above)"
+fi
+echo
+
+if [ -n "${WAKEUP_HERDR:-}" ]; then
+  if pid="$(watcher_pid 2>/dev/null)"; then
+    echo "watcher: running (pid $pid)"
+  elif [ -f "$(pidfile)" ]; then
+    echo "watcher: not running (stale pidfile present: $(pidfile))"
+  else
+    echo "watcher: not running (no pidfile)"
+  fi
+  echo "pidfile: $(pidfile)"
+  echo "logfile: $(logfile)"
+  echo
+
+  "$WAKEUP_HERDR" doctor || echo "(wakeup-herdr doctor exited non-zero)"
+  echo
+
+  echo "--- recent log tail ---"
+  log="$(logfile)"
+  if [ -f "$log" ]; then
+    tail -n 20 "$log"
+  else
+    echo "(no log yet)"
+  fi
+else
+  echo "wakeup-herdr binary not found; skipping watcher/pidfile/log checks"
+fi

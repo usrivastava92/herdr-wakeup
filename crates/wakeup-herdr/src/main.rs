@@ -71,6 +71,8 @@ fn main() {
         Some("arm") => return set_armed(true),
         Some("disarm") => return set_armed(false),
         Some("state") => return print_state(),
+        Some("paths") => return print_paths(),
+        Some("doctor") => return run_doctor(),
         _ => {}
     }
 
@@ -125,6 +127,7 @@ fn print_state() {
     match persist::RuntimeState::load(&persist::state_path()) {
         (Some(rt), _) => {
             println!("state: {} (armed={})", rt.state, rt.armed);
+            println!("session_key: {}", rt.session_key);
             println!("watcher_pid: {}", rt.watcher_pid);
             println!("assertion_active: {}", rt.assertion_active);
             println!(
@@ -136,6 +139,12 @@ fn print_state() {
                 println!("  working: {w}");
             }
             println!("last_transition_unix: {}", rt.last_transition_unix);
+            let age = unix_now().saturating_sub(rt.checked_at_unix);
+            print!("checked_at_unix: {} ({age}s ago", rt.checked_at_unix);
+            if age > STALE_STATE_SECS {
+                print!(" - STALE: watcher may have crashed or hung");
+            }
+            println!(")");
             if let Some(e) = &rt.last_error {
                 println!("last_error: {e}");
             }
@@ -143,6 +152,114 @@ fn print_state() {
         (None, Some(e)) => println!("state: unavailable ({e})"),
         (None, None) => println!("state: no runtime state yet (watcher has not run)"),
     }
+}
+
+/// A state file older than this (in seconds) while nothing has changed is
+/// flagged as possibly stale (Milestone 5: "status identifies stale watcher
+/// state"). Comfortably above the default 60s backstop so a healthy, idle
+/// watcher is never falsely flagged.
+const STALE_STATE_SECS: u64 = 150;
+
+/// `wakeup-herdr paths`: print the resolved, session-scoped config/state
+/// directories as `KEY='value'` lines, safe to `eval` in the plugin's bash
+/// scripts (Milestone 5, item 5). This is the single source of truth for
+/// where files live - bash never re-derives the session-key hash itself, so
+/// the two can never drift apart.
+fn print_paths() {
+    let socket = persist::socket_hint();
+    let key = persist::session_key(&socket);
+    println!("CONFIG_DIR='{}'", shell_escape(&persist::config_dir()));
+    println!("STATE_DIR='{}'", shell_escape(&persist::state_dir()));
+    println!("SESSION_KEY='{}'", key.replace('\'', "'\\''"));
+}
+
+fn shell_escape(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\'', "'\\''")
+}
+
+/// `wakeup-herdr doctor`: a one-shot diagnostic dump (Milestone 5). Never
+/// requires a running watcher; every check degrades to a clear "no/missing/
+/// corrupt" line rather than erroring out, so `doctor` itself is always safe
+/// to run first when something seems wrong.
+fn run_doctor() {
+    let socket = persist::socket_hint();
+    let key = persist::session_key(&socket);
+    println!("wakeup-herdr doctor");
+    println!("===================");
+    println!("session_key: {key}");
+    println!("socket:      {socket}");
+    let reachable = UnixStream::connect(&socket).is_ok();
+    println!("  reachable: {}", if reachable { "yes" } else { "no" });
+
+    let (cfg, cfg_err) = persist::Config::load(&persist::config_path());
+    println!("config_dir:  {}", persist::config_dir().display());
+    match &cfg_err {
+        Some(e) => println!("  config:    CORRUPT, using defaults ({e})"),
+        None => println!("  config:    ok"),
+    }
+    println!("  armed:     {}", cfg.armed);
+    println!(
+        "  wakeup_bin: {} ({})",
+        cfg.wakeup_bin,
+        bin_status(&cfg.wakeup_bin)
+    );
+    println!(
+        "  herdr_bin:  {} ({})",
+        cfg.herdr_bin,
+        bin_status(&cfg.herdr_bin)
+    );
+
+    println!("state_dir:   {}", persist::state_dir().display());
+    match persist::RuntimeState::load(&persist::state_path()) {
+        (Some(rt), _) => {
+            let age = unix_now().saturating_sub(rt.checked_at_unix);
+            let stale = if age > STALE_STATE_SECS {
+                " - STALE, watcher may have crashed or hung"
+            } else {
+                ""
+            };
+            println!("  state:     {} (checked {age}s ago{stale})", rt.state);
+            println!(
+                "  watcher_pid: {} (pid alive: {})",
+                rt.watcher_pid,
+                pid_alive(rt.watcher_pid)
+            );
+            if let Some(e) = &rt.last_error {
+                println!("  last_error: {e}");
+            }
+        }
+        (None, Some(e)) => println!("  state:     CORRUPT ({e})"),
+        (None, None) => println!("  state:     none yet (watcher has never run)"),
+    }
+}
+
+fn bin_status(bin: &str) -> &'static str {
+    if run_status(bin, &["--version"]) {
+        "found"
+    } else {
+        "NOT FOUND or failed to run"
+    }
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: `kill(pid, 0)` sends no signal; it only probes whether `pid`
+    // exists and is signalable, which is safe for any pid value.
+    unsafe { libc_kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 // --------------------------------------------------------------------------- //
@@ -711,6 +828,8 @@ impl App {
             agent_count: snap.total,
             last_transition_unix: self.last_transition_unix,
             last_error: self.sm.last_error().map(str::to_string),
+            checked_at_unix: unix_now(),
+            session_key: persist::session_key(&persist::socket_hint()),
         };
         if let Err(e) = rt.save(&self.state_path) {
             self.log(&format!("failed to write state file: {e}"));
@@ -1283,6 +1402,54 @@ mod tests {
         let (rt, err) = persist::RuntimeState::load(&state_path);
         assert!(err.is_none());
         assert_eq!(rt.unwrap().state, "Off");
+
+        cleanup(&cfg_path);
+    }
+
+    /// Milestone 5 acceptance criterion: if the `wakeup` child exits while
+    /// the state machine still believes it should be Awake, the watcher
+    /// notices on the next evaluation and restarts it (rather than silently
+    /// leaving the system able to sleep despite `assertion_active: true` in
+    /// its own state file). The dead child is reaped synchronously via
+    /// `.wait()` instead of racing a real timing-dependent process exit, so
+    /// this test is deterministic.
+    #[test]
+    fn dead_wakeup_child_is_restarted_while_still_awake() {
+        let (cfg_path, state_path) = tmp_paths("dead_child_restart");
+        let mut app = test_app(&["working"]);
+        app.config_path = cfg_path.clone();
+        app.state_path = state_path.clone();
+
+        app.apply(working_snapshot(), "test");
+        app.apply(working_snapshot(), "test");
+        assert_eq!(app.sm.state(), state::State::Awake);
+        assert!(app.sm.holding());
+
+        let old_pid = app.keeper.child.as_ref().unwrap().id();
+        app.keeper.child.as_mut().unwrap().wait().unwrap();
+        assert!(
+            !app.keeper.running(),
+            "the child must be reaped and reported as not running"
+        );
+
+        // Nothing about `working` changed, so the state machine stays Awake
+        // and the watcher must notice the dead child and respawn it.
+        app.apply(working_snapshot(), "test");
+        assert_eq!(
+            app.sm.state(),
+            state::State::Awake,
+            "must still believe it is Awake"
+        );
+        let new_pid = app.keeper.child.as_ref().map(|c| c.id());
+        assert!(
+            new_pid.is_some(),
+            "a replacement child must have been spawned"
+        );
+        assert_ne!(
+            new_pid,
+            Some(old_pid),
+            "the replacement must be a new process, not the dead one"
+        );
 
         cleanup(&cfg_path);
     }
