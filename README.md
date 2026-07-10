@@ -23,8 +23,17 @@ No `herdr` process is spawned during normal operation; a CLI shellout only happe
 
 - macOS.
 - Herdr `>= 0.7.0`.
-- `wakeup` installed on `PATH`.
-- Rust toolchain for source installs.
+- Rust toolchain, to build this repo's own small watcher binary (`wakeup-herdr`) from source.
+- **No separate `wakeup` install and no cargo build for it**: a prebuilt `wakeup` binary for your platform is vendored inside this repo (see below). It is only necessary to have `wakeup` on `PATH` yourself if your platform/arch isn't one of the vendored combos yet.
+
+## Vendored `wakeup` binary
+
+`plugin/vendor/<os>-<arch>/wakeup` in this repo holds a prebuilt copy of the standalone `wakeup` CLI (separate repo) for each supported platform, refreshed automatically by [`.github/workflows/vendor-wakeup.yml`](.github/workflows/vendor-wakeup.yml) whenever `wakeup` cuts a new release, and committed straight into git (these binaries are tiny - `wakeup` has zero external dependencies).
+`resolve_bins` in `plugin/bin/lib.sh` picks the file matching `uname -s`/`uname -m` automatically and makes it executable; it only falls back to a `wakeup` on `PATH` if no vendored binary matches your platform/arch.
+This means cloning or `herdr plugin install`-ing this repo is enough - there's no separate `wakeup` install step, and no cargo/Rust needed for `wakeup` itself (only for this repo's own `wakeup-herdr` watcher, which is a tiny, dependency-free crate).
+
+Currently vendored: `macos-arm64`, `linux-x86_64`, `linux-arm64`, `windows-x86_64` (Linux binaries are static `musl` builds, so they run on any distro regardless of glibc version).
+To refresh manually: `WAKEUP_REPO=<owner>/wakeup plugin/bin/vendor-wakeup [tag]` (defaults to the latest release).
 
 ## Build and link locally
 
@@ -118,8 +127,8 @@ Every field in `config.json`, with its default and what it does. All of these mi
 | `statuses` | array of strings | `["working"]` | Which Herdr agent statuses count as "active" for wake purposes. |
 | `notify` | bool | `true` | Post a toast notification on wake/sleep transitions. |
 | `allow_cli_fallback` | bool | `false` | If the Herdr socket itself is unreachable, shell out to `herdr agent list` instead of just reporting unavailable. |
-| `wakeup_bin` | string, **optional, absent by default** | resolved on `PATH` | Override the `wakeup` binary path/name. This key is *not* written into a freshly bootstrapped config.json - it's auto-detected via `PATH`, not a fixed default value worth showing, so it only appears if you add it yourself to point at a specific binary. |
-| `herdr_bin` | string, **optional, absent by default** | resolved on `PATH` | Same idea as `wakeup_bin`, for the `herdr` binary (used only for `--once` and CLI fallback). |
+| `wakeup_bin` | string, **optional, absent by default** | auto (vendored binary, else `PATH`) | Force a specific `wakeup` binary path/name, bypassing the vendored-binary resolution entirely. This key is *not* written into a freshly bootstrapped config.json - it only appears if you add it yourself. |
+| `herdr_bin` | string, **optional, absent by default** | resolved on `PATH` | Same idea as `wakeup_bin`, for the `herdr` binary (used only for `--once` and CLI fallback; not vendored). |
 
 A freshly bootstrapped config.json therefore looks like this - 7 fields, no `wakeup_bin`/`herdr_bin` clutter:
 
@@ -135,7 +144,7 @@ A freshly bootstrapped config.json therefore looks like this - 7 fields, no `wak
 }
 ```
 
-`wakeup-herdr doctor` (and `herdr plugin action invoke doctor --plugin herdr-wakeup`) prints every field above, including `wakeup_bin`/`herdr_bin`'s *effective* value even when absent from the file (`auto (resolved on PATH; not set in config.json)` vs `<path> (override, set in config.json)`), so you never have to open the file just to see what's in effect.
+`wakeup-herdr doctor` (and `herdr plugin action invoke doctor --plugin herdr-wakeup`) prints every field above, including `wakeup_bin`/`herdr_bin`'s *effective* value and exactly where it came from - a config override, the `$WAKEUP_BIN`/`$HERDR_BIN_PATH` env var (what the plugin scripts set after resolving a vendored binary), or plain `PATH` auto-detection - so you never have to open the file or guess just to see what's actually in effect.
 
 `armed` is re-read from config on every evaluation, not just at startup. The supported way to flip it is the plugin actions:
 

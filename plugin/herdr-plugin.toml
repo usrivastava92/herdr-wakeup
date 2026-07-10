@@ -3,6 +3,12 @@ name = "Herdr Wakeup"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
 description = "Keep macOS awake while Herdr agents are working, using the standalone wakeup binary."
+# This reflects Herdr's own current platform support (macOS-only - its
+# Homebrew formula only ships an arm64 macOS bottle today), not a
+# limitation of this plugin's own code: wakeup-herdr has no OS-specific
+# logic at all, it only shells out to the vendored/PATH `wakeup` binary,
+# which is genuinely cross-platform. Broaden this once Herdr itself runs
+# on Linux/Windows - it should not be broadened just because wakeup did.
 platforms = ["macos"]
 
 # Only runs on `herdr plugin install` (from GitHub), not on `plugin link`.

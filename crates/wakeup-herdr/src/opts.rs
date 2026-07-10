@@ -87,11 +87,8 @@ impl Opts {
         let home = std::env::var("HOME").unwrap_or_default();
         let default_socket = std::env::var("HERDR_SOCKET_PATH")
             .unwrap_or_else(|_| format!("{home}/.config/herdr/herdr.sock"));
-        let default_herdr = std::env::var("HERDR_BIN_PATH")
-            .or_else(|_| std::env::var("WAKEUP_HERDR_BIN"))
-            .unwrap_or_else(|_| cfg.effective_herdr_bin());
-        let default_wakeup =
-            std::env::var("WAKEUP_BIN").unwrap_or_else(|_| cfg.effective_wakeup_bin());
+        let default_herdr = resolve_herdr_bin(&cfg);
+        let default_wakeup = resolve_wakeup_bin(&cfg);
 
         let mut o = Opts {
             socket: default_socket,
@@ -155,6 +152,23 @@ impl Opts {
         }
         o
     }
+}
+
+/// Resolves the `wakeup` binary with the same precedence `Opts::parse` uses
+/// (env var overrides the config file), so anything else that needs to know
+/// "what will actually get spawned" - currently just `doctor` - reports the
+/// exact same thing the running watcher would use, instead of re-deriving
+/// it independently and drifting out of sync (e.g. `doctor` used to check
+/// only the config/PATH and ignore $WAKEUP_BIN entirely).
+pub fn resolve_wakeup_bin(cfg: &persist::Config) -> String {
+    std::env::var("WAKEUP_BIN").unwrap_or_else(|_| cfg.effective_wakeup_bin())
+}
+
+/// Same idea as [`resolve_wakeup_bin`], for the `herdr` binary.
+pub fn resolve_herdr_bin(cfg: &persist::Config) -> String {
+    std::env::var("HERDR_BIN_PATH")
+        .or_else(|_| std::env::var("WAKEUP_HERDR_BIN"))
+        .unwrap_or_else(|_| cfg.effective_herdr_bin())
 }
 
 fn val(v: Option<String>, flag: &str) -> String {

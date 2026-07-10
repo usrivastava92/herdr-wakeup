@@ -1,20 +1,53 @@
 #!/usr/bin/env bash
 # Shared helpers for the herdr-wakeup plugin. Sourced, not executed.
 
+# Maps the current OS/arch to the plugin/vendor/<combo> directory naming used
+# by both bin/vendor-wakeup and resolve_bins below. Keep in sync with the
+# ASSET_MAP in bin/vendor-wakeup and the release.yml matrix in the wakeup repo.
+_vendor_combo() {
+  local os arch
+  case "$(uname -s)" in
+    Darwin) os="macos" ;;
+    Linux) os="linux" ;;
+    MINGW* | MSYS* | CYGWIN*) os="windows" ;;
+    *) os="unknown" ;;
+  esac
+  case "$(uname -m)" in
+    arm64 | aarch64) arch="arm64" ;;
+    x86_64 | amd64) arch="x86_64" ;;
+    *) arch="unknown" ;;
+  esac
+  printf '%s-%s' "$os" "$arch"
+}
+
 # Resolve the wakeup / wakeup-herdr binaries and export WAKEUP_BIN so the watcher
-# can spawn the mechanism. The standalone wakeup binary is expected on PATH.
-# The watcher can be installed or loaded from this repo's release build.
+# can spawn the mechanism.
 resolve_bins() {
-  local here repo
+  local here repo combo vendor_bin
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../plugin/bin
   repo="$(cd "$here/../.." && pwd)"                       # plugin repo root
 
   export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-  # `wakeup` is the separate, general-purpose, user-facing CLI (its own repo,
-  # meant to be installed on PATH). It is the only binary this plugin expects
-  # to find on PATH.
-  WAKEUP="$(command -v wakeup 2>/dev/null || true)"
+  # `wakeup` is the separate, general-purpose CLI (its own repo). It does not
+  # need to be separately installed by the end user: this repo vendors a
+  # prebuilt binary per platform under plugin/vendor/<os>-<arch>/ (kept up to
+  # date by bin/vendor-wakeup / the vendor-wakeup CI workflow), so a plain
+  # `herdr plugin install` of this repo brings a working wakeup along with
+  # no Rust toolchain required. A PATH-installed `wakeup` is still honored as
+  # a fallback/override, e.g. for local development or an unvendored
+  # platform combo.
+  combo="$(_vendor_combo)"
+  vendor_bin="$repo/plugin/vendor/$combo/wakeup"
+  [ "$combo" = "windows-x86_64" ] && vendor_bin="$repo/plugin/vendor/$combo/wakeup.exe"
+
+  WAKEUP=""
+  if [ -f "$vendor_bin" ]; then
+    chmod +x "$vendor_bin" 2>/dev/null || true
+    WAKEUP="$vendor_bin"
+  else
+    WAKEUP="$(command -v wakeup 2>/dev/null || true)"
+  fi
 
   # `wakeup-herdr` is an internal implementation detail of *this* plugin, not
   # a tool end users are meant to install or run directly. It is never
@@ -26,7 +59,8 @@ resolve_bins() {
   [ -x "$repo/target/release/wakeup-herdr" ] && WAKEUP_HERDR="$repo/target/release/wakeup-herdr"
 
   if [ -z "$WAKEUP" ]; then
-    echo "herdr-wakeup: standalone wakeup binary not found on PATH. Install wakeup first." >&2
+    echo "herdr-wakeup: no wakeup binary for $combo in plugin/vendor/, and none found on PATH either." >&2
+    echo "  Either wait for the next vendor-wakeup CI run, run 'plugin/bin/vendor-wakeup' yourself, or install wakeup on PATH manually." >&2
     return 1
   fi
   if [ -z "$WAKEUP_HERDR" ]; then

@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Downloads the latest (or a pinned) `wakeup` release from the wakeup repo
+# and lays the binaries out under plugin/vendor/<os>-<arch>/wakeup(.exe), so
+# that a plain `git clone` / `herdr plugin install` of this repo brings a
+# working `wakeup` binary along - no separate install step, no Rust
+# toolchain required by the end user for `wakeup` itself.
+#
+# Usage:
+#   plugin/bin/vendor-wakeup                # latest release
+#   plugin/bin/vendor-wakeup v0.2.0          # a specific tag
+#   WAKEUP_REPO=someorg/wakeup plugin/bin/vendor-wakeup
+#
+# Requires the `gh` CLI, authenticated against GitHub.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" # plugin/bin
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+VENDOR_DIR="$REPO_ROOT/plugin/vendor"
+
+# TODO: update once the wakeup repo has a real GitHub remote.
+WAKEUP_REPO="${WAKEUP_REPO:-<owner>/wakeup}"
+TAG="${1:-}"
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "vendor-wakeup: the 'gh' CLI is required (https://cli.github.com/)" >&2
+  exit 1
+fi
+
+# release-asset-name -> plugin/vendor/<dir>/<binary-name>
+declare -A ASSET_MAP=(
+  ["wakeup-macos-arm64"]="macos-arm64/wakeup"
+  ["wakeup-macos-x86_64"]="macos-x86_64/wakeup"
+  ["wakeup-linux-x86_64"]="linux-x86_64/wakeup"
+  ["wakeup-linux-arm64"]="linux-arm64/wakeup"
+  ["wakeup-windows-x86_64.exe"]="windows-x86_64/wakeup.exe"
+)
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+dl_args=(release download --repo "$WAKEUP_REPO" --dir "$tmp_dir" --clobber)
+if [ -n "$TAG" ]; then
+  dl_args+=("$TAG")
+else
+  dl_args+=(--pattern "wakeup-*")
+fi
+
+echo "vendor-wakeup: downloading from $WAKEUP_REPO${TAG:+ @ $TAG} ..."
+gh "${dl_args[@]}"
+
+updated=0
+for asset in "${!ASSET_MAP[@]}"; do
+  src="$tmp_dir/$asset"
+  dest_rel="${ASSET_MAP[$asset]}"
+  dest="$VENDOR_DIR/$dest_rel"
+  if [ ! -f "$src" ]; then
+    echo "vendor-wakeup: warning: $asset not found in release, skipping ($dest_rel stays as-is)" >&2
+    continue
+  fi
+  mkdir -p "$(dirname "$dest")"
+  cp "$src" "$dest"
+  chmod +x "$dest"
+  echo "vendor-wakeup: updated $dest_rel"
+  updated=$((updated + 1))
+done
+
+if [ "$updated" -eq 0 ]; then
+  echo "vendor-wakeup: no assets were updated - check WAKEUP_REPO/tag and the release's asset names" >&2
+  exit 1
+fi
+
+echo "vendor-wakeup: done ($updated binaries updated)"

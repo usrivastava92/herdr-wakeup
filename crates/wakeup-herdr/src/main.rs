@@ -208,15 +208,21 @@ fn run_doctor() {
     println!("  statuses:            {}", cfg.statuses.join(", "));
     println!("  notify:              {}", cfg.notify);
     println!("  allow_cli_fallback:  {}", cfg.allow_cli_fallback);
+    let resolved_wakeup = opts::resolve_wakeup_bin(&cfg);
+    let resolved_herdr = opts::resolve_herdr_bin(&cfg);
     println!(
         "  wakeup_bin:          {} ({})",
-        describe_bin_override(&cfg.wakeup_bin),
-        bin_status(&cfg.effective_wakeup_bin())
+        describe_bin_source(&cfg.wakeup_bin, &["WAKEUP_BIN"], &resolved_wakeup),
+        bin_status(&resolved_wakeup)
     );
     println!(
         "  herdr_bin:           {} ({})",
-        describe_bin_override(&cfg.herdr_bin),
-        bin_status(&cfg.effective_herdr_bin())
+        describe_bin_source(
+            &cfg.herdr_bin,
+            &["HERDR_BIN_PATH", "WAKEUP_HERDR_BIN"],
+            &resolved_herdr
+        ),
+        bin_status(&resolved_herdr)
     );
 
     println!("state_dir:   {}", persist::state_dir().display());
@@ -243,15 +249,27 @@ fn run_doctor() {
     }
 }
 
-/// Describes a `wakeup_bin`/`herdr_bin` config override for `doctor` output:
-/// `None` means the field is absent from config.json and PATH is used, which
-/// is the common case and worth saying explicitly rather than just printing
-/// the resolved name (which would look identical to an intentional override).
-fn describe_bin_override(bin: &Option<String>) -> String {
-    match bin {
-        Some(b) => format!("{b} (override, set in config.json)"),
-        None => "auto (resolved on PATH; not set in config.json)".to_string(),
+/// Describes *where* a resolved `wakeup_bin`/`herdr_bin` value actually came
+/// from, for `doctor` output - config override, an env var (e.g. what the
+/// plugin's bash scripts set after resolving a vendored binary), or plain
+/// PATH auto-detection - rather than just printing the resolved path, which
+/// would look identical regardless of source.
+fn describe_bin_source(
+    cfg_override: &Option<String>,
+    env_names: &[&str],
+    resolved: &str,
+) -> String {
+    if let Some(v) = cfg_override {
+        return format!("{v} (override, set in config.json)");
     }
+    for name in env_names {
+        if let Ok(v) = std::env::var(name) {
+            if v == resolved {
+                return format!("{resolved} (from ${name})");
+            }
+        }
+    }
+    format!("{resolved} (auto, resolved on PATH)")
 }
 
 fn bin_status(bin: &str) -> &'static str {

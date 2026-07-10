@@ -1,0 +1,41 @@
+name: Vendor wakeup binaries
+
+# Pulls the latest wakeup release binaries into plugin/vendor/ and commits
+# them, so `herdr plugin install`ing this repo brings a working `wakeup`
+# along without the end user needing a Rust toolchain. Runs weekly (to pick
+# up new wakeup releases) and on demand.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "wakeup tag to vendor (blank = latest release)"
+        required: false
+  schedule:
+    - cron: "0 6 * * 1" # every Monday
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vendor wakeup binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: plugin/bin/vendor-wakeup "${{ github.event.inputs.tag }}"
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet -- plugin/vendor; then
+            echo "no vendor changes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add plugin/vendor
+          git commit -m "chore: vendor latest wakeup binaries"
+          git push
