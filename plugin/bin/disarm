@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Action: pause wake/sleep decisions without stopping the watcher.
+#
+# This just flips `armed: false` in the persisted config.json - it does not
+# require the watcher to be running, so this survives a watcher restart, and
+# a running watcher releases any held wake assertion and stops acquiring new
+# ones on its next evaluation without needing a restart or signal (see
+# App::reload_armed / StateMachine::force_off, Milestone 4). The watcher
+# keeps observing Herdr while disarmed, so `status` can still report it.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$DIR/lib.sh"
+resolve_bins
+"$WAKEUP_HERDR" disarm

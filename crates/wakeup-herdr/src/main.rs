@@ -23,12 +23,15 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 mod opts;
 use opts::Opts;
+
+mod persist;
 
 mod state;
 use state::{Action, Input, StateMachine};
@@ -58,10 +61,23 @@ fn stopping() -> bool {
 }
 
 fn main() {
+    // `arm`/`disarm`/`state` are plain positional subcommands (Milestone 4),
+    // handled before `Opts::parse()` since they act on the config/state
+    // files directly rather than running the watcher. This is what lets
+    // `disarm` survive a watcher restart and take effect on a *running*
+    // watcher without a restart or signal: it just writes config.json, which
+    // the watcher re-reads on every evaluation (see `App::reload_armed`).
+    match std::env::args().nth(1).as_deref() {
+        Some("arm") => return set_armed(true),
+        Some("disarm") => return set_armed(false),
+        Some("state") => return print_state(),
+        _ => {}
+    }
+
     let o = Opts::parse();
 
     if o.once {
-        let snap = herdr_agents_cli(&o);
+        let snap = fetch_snapshot(&o);
         report_once(&snap, &o);
         return;
     }
@@ -78,6 +94,55 @@ fn main() {
         app.o.display,
     ));
     app.run();
+}
+
+/// `wakeup-herdr arm` / `wakeup-herdr disarm`: flip the persisted `armed`
+/// flag in config.json. Works whether or not the watcher is currently
+/// running, and a running watcher picks up the change on its next
+/// evaluation (see `App::reload_armed`) - so disarm both survives a watcher
+/// restart and takes effect live without one.
+fn set_armed(armed: bool) {
+    let path = persist::config_path();
+    let (mut cfg, err) = persist::Config::load(&path);
+    if let Some(e) = &err {
+        eprintln!("wakeup-herdr: config error (continuing with defaults): {e}");
+    }
+    cfg.armed = armed;
+    match cfg.save(&path) {
+        Ok(()) => println!("{}", if armed { "armed" } else { "disarmed" }),
+        Err(e) => {
+            eprintln!("wakeup-herdr: failed to save {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `wakeup-herdr state`: print the watcher's last-persisted runtime state
+/// (Milestone 4). Reading this never requires a running watcher, a socket
+/// connection, or a `herdr` process; it only ever reads a local file, and a
+/// corrupt/missing one is reported without panicking.
+fn print_state() {
+    match persist::RuntimeState::load(&persist::state_path()) {
+        (Some(rt), _) => {
+            println!("state: {} (armed={})", rt.state, rt.armed);
+            println!("watcher_pid: {}", rt.watcher_pid);
+            println!("assertion_active: {}", rt.assertion_active);
+            println!(
+                "agents: {} matching, {} total",
+                rt.working_agents.len(),
+                rt.agent_count
+            );
+            for w in &rt.working_agents {
+                println!("  working: {w}");
+            }
+            println!("last_transition_unix: {}", rt.last_transition_unix);
+            if let Some(e) = &rt.last_error {
+                println!("last_error: {e}");
+            }
+        }
+        (None, Some(e)) => println!("state: unavailable ({e})"),
+        (None, None) => println!("state: no runtime state yet (watcher has not run)"),
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -179,6 +244,20 @@ fn agent_list_via_socket(o: &Opts, timeout: Duration) -> Snapshot {
     }
 }
 
+/// Fetch a fresh snapshot: the socket `agent.list` RPC is the primary path,
+/// falling back to the CLI only when `--allow-cli-fallback` is set and the
+/// socket itself didn't answer. Shared by the running watcher (`App::
+/// snapshot`) and `--once`/diagnostics, so `--once` also does "a fresh
+/// socket check" per Milestone 4 rather than always shelling out.
+fn fetch_snapshot(o: &Opts) -> Snapshot {
+    let snap = agent_list_via_socket(o, Duration::from_secs(5));
+    if snap.available || !o.allow_cli_fallback {
+        snap
+    } else {
+        herdr_agents_cli(o)
+    }
+}
+
 fn agent_label(a: &serde_json::Value) -> String {
     let name = a
         .get("agent")
@@ -275,6 +354,10 @@ struct App {
     subscribed: BTreeSet<String>,
     unavailable_since: Option<Instant>, // first time Herdr became unreachable
     herdr_gone: bool,                   // Herdr unreachable past --exit-after: time to quit
+    config_path: PathBuf,
+    state_path: PathBuf,
+    config_error: Option<String>, // last config-load error, to log only on change
+    last_transition_unix: u64,    // unix time of the last Acquire/Release
 }
 
 enum Poll {
@@ -295,6 +378,10 @@ impl App {
             subscribed: BTreeSet::new(),
             unavailable_since: None,
             herdr_gone: false,
+            config_path: persist::config_path(),
+            state_path: persist::state_path(),
+            config_error: None,
+            last_transition_unix: unix_now(),
         }
     }
 
@@ -380,17 +467,9 @@ impl App {
         true
     }
 
-    /// Fetch a fresh snapshot: the socket `agent.list` RPC is the primary
-    /// path (a new short-lived connection every time), falling back to the
-    /// CLI only when `--allow-cli-fallback` is set and the socket itself
-    /// didn't answer.
+    /// Fetch a fresh snapshot (see the free function `fetch_snapshot`).
     fn snapshot(&self) -> Snapshot {
-        let snap = agent_list_via_socket(&self.o, Duration::from_secs(5));
-        if snap.available || !self.o.allow_cli_fallback {
-            snap
-        } else {
-            herdr_agents_cli(&self.o)
-        }
+        fetch_snapshot(&self.o)
     }
 
     /// Read events on the subscription connection until the pane set
@@ -463,6 +542,11 @@ impl App {
     fn apply(&mut self, snap: Snapshot, reason: &str) -> bool {
         let now = Instant::now();
 
+        // Re-read `armed` from the config file on every evaluation (not just
+        // at startup), so `wakeup-herdr disarm`/`arm` take effect on an
+        // already-running watcher without a restart (Milestone 4).
+        let armed = self.reload_armed();
+
         // Tie our lifecycle to the Herdr server: if it stays unreachable past the
         // tolerance window (surviving brief blips and restarts), quit. There are
         // no agents to track without Herdr, so lingering would be pointless.
@@ -476,22 +560,29 @@ impl App {
                     now.duration_since(since).as_secs_f64()
                 ));
                 self.herdr_gone = true;
+                self.write_state(&snap, armed);
                 return false;
             }
         }
 
         let working = !snap.working.is_empty();
-        let action = self.sm.step(
-            Input {
-                available: snap.available,
-                working,
-            },
-            now,
-        );
+        // When disarmed, force an immediate release (bypassing stop_grace)
+        // instead of stepping the normal state machine at all.
+        let action = if armed {
+            self.sm.step(
+                Input {
+                    available: snap.available,
+                    working,
+                },
+                now,
+            )
+        } else {
+            self.sm.force_off()
+        };
 
         if self.o.verbose {
             self.log(&format!(
-                "[{reason}] working=[{}] state={} action={:?}{}",
+                "[{reason}] working=[{}] armed={armed} state={} action={:?}{}",
                 snap.working.join(", "),
                 self.sm.state(),
                 action,
@@ -503,23 +594,34 @@ impl App {
         }
 
         match action {
-            Action::Acquire => match self.keeper.start() {
-                Ok(()) => {
-                    let detail = summarize(&snap.working);
-                    self.log(&format!("AWAKE   -> {detail}"));
-                    self.toast("☕ Keeping awake", &detail);
+            Action::Acquire => {
+                match self.keeper.start() {
+                    Ok(()) => {
+                        let detail = summarize(&snap.working);
+                        self.log(&format!("AWAKE   -> {detail}"));
+                        self.toast("☕ Keeping awake", &detail);
+                    }
+                    Err(e) => self.log(&format!("failed to start wakeup: {e}")),
                 }
-                Err(e) => self.log(&format!("failed to start wakeup: {e}")),
-            },
+                self.last_transition_unix = unix_now();
+            }
             Action::Release => {
                 self.keeper.stop();
-                self.log("SLEEP-OK <- all agents idle/blocked");
-                self.toast("💤 Sleep allowed", "no agents working");
+                if armed {
+                    self.log("SLEEP-OK <- all agents idle/blocked");
+                    self.toast("💤 Sleep allowed", "no agents working");
+                } else {
+                    self.log("DISARMED <- released wake assertion");
+                    self.toast("⏸ Disarmed", "wake assertions paused");
+                }
+                self.last_transition_unix = unix_now();
             }
             Action::None => {
                 // No transition this round, but make sure the assertion is
                 // actually still held whenever the state machine believes it
-                // should be (recovers a crashed/killed `wakeup` child).
+                // should be (recovers a crashed/killed `wakeup` child). Only
+                // applies while armed: `force_off` already guarantees
+                // `sm.holding()` is false whenever disarmed.
                 if self.sm.holding() && !self.keeper.running() {
                     match self.keeper.start() {
                         Ok(()) => self.log("restarted wakeup (child had exited)"),
@@ -528,6 +630,8 @@ impl App {
                 }
             }
         }
+
+        self.write_state(&snap, armed);
 
         // report pane-set change for re-subscribe
         snap.available && snap.panes != self.subscribed
@@ -575,12 +679,59 @@ impl App {
         // Expect the explicit subscription_started ack within a short window.
         matches!(conn.recv_json(Duration::from_secs(3)), Some(v) if subscription_started(&v))
     }
+
+    /// Re-read the `armed` flag from config.json. Falls back to `true`
+    /// (armed) on a missing/corrupt config, matching `Config::default()`; a
+    /// corrupt config is only logged when the error text changes (entering
+    /// or leaving the error), not on every single evaluation.
+    fn reload_armed(&mut self) -> bool {
+        let (cfg, err) = persist::Config::load(&self.config_path);
+        if err != self.config_error {
+            match &err {
+                Some(e) => self.log(&format!("config error (using defaults): {e}")),
+                None => self.log("config recovered"),
+            }
+            self.config_error = err;
+        }
+        cfg.armed
+    }
+
+    /// Persist the watcher's current runtime state atomically (Milestone 4).
+    /// Nothing in this process ever reads it back for its own decisions -
+    /// only the separate, short-lived `wakeup-herdr state` invocation does -
+    /// so a slow or failing write here can never affect a wake/sleep
+    /// decision; failures are just logged.
+    fn write_state(&mut self, snap: &Snapshot, armed: bool) {
+        let rt = persist::RuntimeState {
+            state: self.sm.state().to_string(),
+            armed,
+            watcher_pid: std::process::id(),
+            assertion_active: self.sm.holding(),
+            working_agents: snap.working.clone(),
+            agent_count: snap.total,
+            last_transition_unix: self.last_transition_unix,
+            last_error: self.sm.last_error().map(str::to_string),
+        };
+        if let Err(e) = rt.save(&self.state_path) {
+            self.log(&format!("failed to write state file: {e}"));
+        }
+    }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
         self.keeper.stop();
     }
+}
+
+/// Current wall-clock time as Unix seconds, used for `last_transition_unix`
+/// in the persisted runtime state. Defaults to 0 on the (essentially
+/// impossible on a real system) case that the clock is before the epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn summarize(working: &[String]) -> String {
@@ -966,5 +1117,195 @@ mod tests {
         };
         let snap = agent_list_via_socket(&o, Duration::from_millis(200));
         assert!(!snap.available);
+    }
+
+    // ----------------------------------------------------------------- //
+    // Milestone 4: config/state persistence, live armed override
+    // ----------------------------------------------------------------- //
+
+    fn test_app(statuses: &[&str]) -> App {
+        let mut o = test_opts(statuses);
+        // A harmless, near-instant no-op binary instead of the real `wakeup`,
+        // so these tests never depend on (or actually hold) a real macOS
+        // power assertion.
+        o.wakeup_bin = "true".into();
+        o.start_grace = Duration::from_secs(0);
+        App::new(o)
+    }
+
+    /// A fresh temp dir per test, used for both config.json and state.json,
+    /// so tests never share or race on `HERDR_PLUGIN_CONFIG_DIR`/`_STATE_DIR`
+    /// (which are process-global env vars and would be flaky under parallel
+    /// test execution). `App::config_path`/`state_path` are overridden
+    /// directly instead.
+    fn tmp_paths(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "tmp_rovo_app_test_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        (base.join("config.json"), base.join("state.json"))
+    }
+
+    fn working_snapshot() -> Snapshot {
+        Snapshot {
+            available: true,
+            working: vec!["claude@repo".to_string()],
+            panes: BTreeSet::from(["w1:p1".to_string()]),
+            total: 1,
+        }
+    }
+
+    fn idle_snapshot() -> Snapshot {
+        Snapshot {
+            available: true,
+            working: vec![],
+            panes: BTreeSet::from(["w1:p1".to_string()]),
+            total: 1,
+        }
+    }
+
+    fn cleanup(cfg_path: &std::path::Path) {
+        let _ = fs::remove_dir_all(cfg_path.parent().unwrap());
+    }
+
+    use std::fs;
+
+    /// Acceptance criterion: disarm survives a watcher restart. A config
+    /// file with `armed: false` written *before* the watcher ever starts
+    /// must prevent it from acquiring on a fresh `App`, exactly as if
+    /// `disarm` had been run while it was already running.
+    #[test]
+    fn disarmed_config_prevents_acquire_from_a_fresh_start() {
+        let (cfg_path, state_path) = tmp_paths("disarm_survives_restart");
+        persist::Config {
+            armed: false,
+            ..persist::Config::default()
+        }
+        .save(&cfg_path)
+        .unwrap();
+
+        let mut app = test_app(&["working"]);
+        app.config_path = cfg_path.clone();
+        app.state_path = state_path;
+
+        app.apply(working_snapshot(), "test");
+        assert_eq!(app.sm.state(), state::State::Off);
+        assert!(!app.sm.holding());
+
+        cleanup(&cfg_path);
+    }
+
+    /// Disarming a currently-Awake watcher must release immediately (not
+    /// wait out stop_grace), and re-arming must resume normal behavior.
+    #[test]
+    fn disarm_releases_mid_awake_and_rearm_resumes_normal_behavior() {
+        let (cfg_path, state_path) = tmp_paths("disarm_mid_awake");
+        let mut app = test_app(&["working"]);
+        app.config_path = cfg_path.clone();
+        app.state_path = state_path.clone();
+
+        // start_grace is 0, but the state machine still needs a second
+        // evaluation past Off -> PendingWake to check the (already-elapsed)
+        // deadline and transition to Awake.
+        app.apply(working_snapshot(), "test");
+        app.apply(working_snapshot(), "test");
+        assert_eq!(app.sm.state(), state::State::Awake);
+        assert!(app.sm.holding());
+
+        persist::Config {
+            armed: false,
+            ..persist::Config::default()
+        }
+        .save(&cfg_path)
+        .unwrap();
+        // Still "working" in the snapshot, but disarmed must win over that.
+        app.apply(working_snapshot(), "test");
+        assert_eq!(app.sm.state(), state::State::Off);
+        assert!(!app.sm.holding());
+
+        let (rt, err) = persist::RuntimeState::load(&state_path);
+        assert!(err.is_none());
+        let rt = rt.unwrap();
+        assert!(!rt.armed);
+        assert_eq!(rt.state, "Off");
+        assert!(!rt.assertion_active);
+
+        // Re-arm: normal acquire behavior must resume.
+        persist::Config::default().save(&cfg_path).unwrap();
+        app.apply(working_snapshot(), "test");
+        app.apply(working_snapshot(), "test");
+        assert_eq!(app.sm.state(), state::State::Awake);
+        assert!(app.sm.holding());
+
+        cleanup(&cfg_path);
+    }
+
+    /// Acceptance criterion: corrupt config falls back safely (defaults to
+    /// armed) and does not panic or otherwise disrupt evaluation.
+    #[test]
+    fn corrupt_config_during_operation_falls_back_to_armed_without_panicking() {
+        let (cfg_path, state_path) = tmp_paths("corrupt_config_live");
+        fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        fs::write(&cfg_path, b"{ not valid json").unwrap();
+
+        let mut app = test_app(&["working"]);
+        app.config_path = cfg_path.clone();
+        app.state_path = state_path;
+
+        app.apply(working_snapshot(), "test");
+        app.apply(working_snapshot(), "test");
+        assert_eq!(app.sm.state(), state::State::Awake);
+
+        cleanup(&cfg_path);
+    }
+
+    /// Acceptance criterion: corrupt state does not prevent watcher startup
+    /// (or, here, any ongoing evaluation) - by design the watcher never reads
+    /// state.json back for its own decisions, only writes it, so a pre-
+    /// existing corrupt one is simply overwritten cleanly.
+    #[test]
+    fn corrupt_state_file_does_not_block_evaluation_and_gets_overwritten() {
+        let (cfg_path, state_path) = tmp_paths("corrupt_state_live");
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        fs::write(&state_path, b"not json at all").unwrap();
+
+        let mut app = test_app(&["working"]);
+        app.config_path = cfg_path.clone();
+        app.state_path = state_path.clone();
+
+        app.apply(idle_snapshot(), "test");
+        assert_eq!(app.sm.state(), state::State::Off);
+
+        let (rt, err) = persist::RuntimeState::load(&state_path);
+        assert!(err.is_none());
+        assert_eq!(rt.unwrap().state, "Off");
+
+        cleanup(&cfg_path);
+    }
+
+    /// State writes report every evaluation's outcome, including the
+    /// working-agent labels and count, for `wakeup-herdr state` to display.
+    #[test]
+    fn state_file_reflects_working_agents_and_last_transition() {
+        let (cfg_path, state_path) = tmp_paths("state_reflects_agents");
+        let mut app = test_app(&["working"]);
+        app.config_path = cfg_path.clone();
+        app.state_path = state_path.clone();
+
+        app.apply(working_snapshot(), "test");
+        app.apply(working_snapshot(), "test");
+        let (rt, _) = persist::RuntimeState::load(&state_path);
+        let rt = rt.unwrap();
+        assert_eq!(rt.state, "Awake");
+        assert!(rt.assertion_active);
+        assert_eq!(rt.working_agents, vec!["claude@repo".to_string()]);
+        assert_eq!(rt.agent_count, 1);
+        assert!(rt.last_transition_unix > 0);
+
+        cleanup(&cfg_path);
     }
 }

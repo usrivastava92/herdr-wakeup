@@ -32,9 +32,11 @@ make plugin-link
 Then use the plugin actions:
 
 ```bash
-herdr plugin action invoke start  --plugin herdr-wakeup
-herdr plugin action invoke status --plugin herdr-wakeup
-herdr plugin action invoke stop   --plugin herdr-wakeup
+herdr plugin action invoke start   --plugin herdr-wakeup
+herdr plugin action invoke status  --plugin herdr-wakeup
+herdr plugin action invoke arm     --plugin herdr-wakeup   # resume wake/sleep decisions
+herdr plugin action invoke disarm  --plugin herdr-wakeup   # pause without stopping the watcher
+herdr plugin action invoke stop    --plugin herdr-wakeup
 ```
 
 ## Running the watcher directly
@@ -79,6 +81,27 @@ Error        -- recovered --> Off, PendingWake, or Awake
 
 `start_grace` and `grace` (stop grace) exist specifically to absorb brief status flicker: a one-second blip of `working` does not wake the machine, and a one-second blip of idle does not put it back to sleep.
 While a snapshot fetch fails (`Error`), the watcher holds whatever it was already holding rather than guessing; it only changes wake/sleep state again once a snapshot succeeds.
+
+## Config and state files
+
+`wakeup-herdr` persists two small JSON files, deliberately kept separate: a rarely-changing, user-tunable **config** and a frequently-changing, watcher-owned **runtime state**.
+
+| File | Location | Purpose |
+| --- | --- | --- |
+| `config.json` | `$HERDR_PLUGIN_CONFIG_DIR` (or `~/.config/herdr-wakeup` standalone) | `armed`, `display`, `start_grace_seconds`, `stop_grace_seconds`, `statuses`, `notify`, binary paths, `allow_cli_fallback`. Seeds defaults *underneath* CLI flags; CLI flags always win. |
+| `state.json` | `$HERDR_PLUGIN_STATE_DIR` (or `~/.local/state/herdr-wakeup` standalone) | Current state, `armed`, whether the assertion is held, working agents, last transition, last error. Written after every evaluation; never read back by the watcher itself. |
+
+Both are written atomically (temp file + rename), and a missing or corrupt file always falls back safely to defaults rather than crashing or blocking startup - a corrupt config is logged once and defaults to armed.
+
+`armed` is re-read from config on every evaluation, not just at startup, so:
+
+```bash
+wakeup-herdr disarm   # pause: release any held assertion immediately, keep observing
+wakeup-herdr arm      # resume normal wake/sleep decisions
+wakeup-herdr state    # print the last-persisted runtime state (no running watcher needed)
+```
+
+`disarm`/`arm` just flip and atomically save `config.json` - they work whether or not the watcher is running (so `disarm` survives a restart), and an already-running watcher picks up the change on its very next evaluation without a restart or signal.
 
 ## Improvement plan
 

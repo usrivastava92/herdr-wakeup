@@ -138,6 +138,27 @@ impl StateMachine {
         self.last_error = Some(reason.into());
     }
 
+    /// Force an immediate transition to `Off`, bypassing `stop_grace`
+    /// entirely. Used by the `disarm` override (Milestone 4): when disarmed,
+    /// the watcher must release any held assertion right away rather than
+    /// waiting out the idle grace window, and must not let a `PendingWake`
+    /// window continue counting toward an acquire while disarmed. Returns
+    /// `Action::Release` iff an assertion was actually being held (including
+    /// mid-`Error` with `held_before_error`); otherwise `Action::None`. Safe
+    /// to call repeatedly (idempotent once already `Off`).
+    pub fn force_off(&mut self) -> Action {
+        let was_holding = self.holding();
+        self.state = State::Off;
+        self.pending_since = None;
+        self.held_before_error = false;
+        self.last_error = None;
+        if was_holding {
+            Action::Release
+        } else {
+            Action::None
+        }
+    }
+
     /// Advance the state machine by one evaluation. Pure: does not perform
     /// any I/O; the caller is responsible for actually acquiring/releasing
     /// the assertion in response to the returned `Action`.
@@ -388,5 +409,69 @@ mod tests {
         );
         assert_eq!(action, Action::None);
         assert_eq!(sm.state(), State::PendingWake);
+    }
+
+    /// Milestone 4 acceptance: disarming while Awake releases immediately,
+    /// bypassing stop_grace entirely.
+    #[test]
+    fn force_off_releases_immediately_when_awake() {
+        let mut sm = StateMachine::new(secs(5), secs(30));
+        let t0 = Instant::now();
+        feed(&mut sm, t0, &[(0, true), (5, true)]);
+        assert_eq!(sm.state(), State::Awake);
+
+        let action = sm.force_off();
+        assert_eq!(action, Action::Release);
+        assert_eq!(sm.state(), State::Off);
+        assert!(!sm.holding());
+    }
+
+    /// Disarming while merely PendingWake must not let that window continue
+    /// counting toward an acquire, but there was nothing held yet, so no
+    /// Release is reported.
+    #[test]
+    fn force_off_from_pending_wake_is_none_and_clears_pending() {
+        let mut sm = StateMachine::new(secs(5), secs(30));
+        let t0 = Instant::now();
+        feed(&mut sm, t0, &[(0, true)]);
+        assert_eq!(sm.state(), State::PendingWake);
+
+        let action = sm.force_off();
+        assert_eq!(action, Action::None);
+        assert_eq!(sm.state(), State::Off);
+        assert!(sm.deadline().is_none());
+    }
+
+    /// force_off is idempotent: calling it again once already Off is a no-op.
+    #[test]
+    fn force_off_twice_is_idempotent() {
+        let mut sm = StateMachine::new(secs(5), secs(30));
+        feed(&mut sm, Instant::now(), &[(0, true), (5, true)]);
+        assert_eq!(sm.force_off(), Action::Release);
+        assert_eq!(sm.force_off(), Action::None);
+    }
+
+    /// Disarming while held-through-an-Error state still releases (the
+    /// override must win even mid-outage).
+    #[test]
+    fn force_off_releases_when_held_before_error() {
+        let mut sm = StateMachine::new(secs(5), secs(30));
+        let t0 = Instant::now();
+        feed(&mut sm, t0, &[(0, true), (5, true)]);
+        assert_eq!(sm.state(), State::Awake);
+
+        sm.step(
+            Input {
+                available: false,
+                working: false,
+            },
+            t0 + secs(6),
+        );
+        assert_eq!(sm.state(), State::Error);
+        assert!(sm.holding());
+
+        assert_eq!(sm.force_off(), Action::Release);
+        assert_eq!(sm.state(), State::Off);
+        assert!(sm.last_error().is_none());
     }
 }

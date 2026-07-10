@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 # Action: show the current keep-awake decision and whether a background watcher runs.
+#
+# Per Milestone 4, this reads the watcher's last-persisted runtime state
+# first (state.json - always available immediately, no socket needed), then
+# does a fresh socket check on top (`--once`), so a stale/crashed watcher and
+# a genuinely-current decision are both visible in one place.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
@@ -11,4 +16,9 @@ if pid="$(watcher_pid)"; then
 else
   echo "herdr-wakeup watcher: not running"
 fi
+
+echo "--- last known state ---"
+"$WAKEUP_HERDR" state
+
+echo "--- fresh check ---"
 "$WAKEUP_HERDR" --once

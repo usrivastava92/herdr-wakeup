@@ -30,3 +30,15 @@ id = "status"
 title = "Wakeup: status"
 contexts = ["global", "workspace", "pane"]
 command = ["bash", "bin/status"]
+
+[[actions]]
+id = "arm"
+title = "Wakeup: arm"
+contexts = ["global", "workspace", "pane"]
+command = ["bash", "bin/arm"]
+
+[[actions]]
+id = "disarm"
+title = "Wakeup: disarm"
+contexts = ["global", "workspace", "pane"]
+command = ["bash", "bin/disarm"]

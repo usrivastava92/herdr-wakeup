@@ -1,5 +1,6 @@
 //! CLI + environment parsing for wakeup-herdr.
 
+use crate::persist;
 use std::time::Duration;
 
 pub struct Opts {
@@ -39,6 +40,11 @@ spawned during normal operation): if any agent is working it runs wakeup,
 otherwise it lets the machine sleep. If the socket itself is unreachable it
 just reports unavailable and retries, unless --allow-cli-fallback is set.
 
+A JSON config file (config.json in $HERDR_PLUGIN_CONFIG_DIR, or
+~/.config/herdr-wakeup standalone) seeds these defaults below the CLI flags;
+see `wakeup-herdr arm`/`disarm` and `wakeup-herdr state` for the config/state
+subcommands.
+
 OPTIONS:
     -d, --display        Also keep the display awake (runs `wakeup -di`).
     --start-grace <secs> Require this much sustained working time before acquiring (default 5).
@@ -61,30 +67,43 @@ OPTIONS:
 
 impl Opts {
     pub fn parse() -> Opts {
+        // Config file values seed the defaults below (precedence: built-in <
+        // config file < env var < CLI flag). A missing config is normal and
+        // silent; a corrupt one falls back safely and is reported here, per
+        // Milestone 4's "corrupt config falls back safely and reports an
+        // error" acceptance criterion. `armed` itself is intentionally not
+        // read into Opts: the watcher re-reads it live on every evaluation
+        // (see App::reload_armed) so `disarm`/`arm` take effect without a
+        // restart, instead of only being read once at startup.
+        let (cfg, cfg_err) = persist::Config::load(&persist::config_path());
+        if let Some(e) = &cfg_err {
+            eprintln!("wakeup-herdr: config error (using defaults): {e}");
+        }
+
         let home = std::env::var("HOME").unwrap_or_default();
         let default_socket = std::env::var("HERDR_SOCKET_PATH")
             .unwrap_or_else(|_| format!("{home}/.config/herdr/herdr.sock"));
         let default_herdr = std::env::var("HERDR_BIN_PATH")
             .or_else(|_| std::env::var("WAKEUP_HERDR_BIN"))
-            .unwrap_or_else(|_| "herdr".into());
-        let default_wakeup = std::env::var("WAKEUP_BIN").unwrap_or_else(|_| "wakeup".into());
+            .unwrap_or(cfg.herdr_bin);
+        let default_wakeup = std::env::var("WAKEUP_BIN").unwrap_or(cfg.wakeup_bin);
 
         let mut o = Opts {
             socket: default_socket,
             herdr_bin: default_herdr,
             wakeup_bin: default_wakeup,
-            display: false,
-            statuses: vec!["working".into()],
-            start_grace: Duration::from_secs(5),
-            grace: Duration::from_secs(30),
+            display: cfg.display,
+            statuses: cfg.statuses,
+            start_grace: Duration::from_secs(cfg.start_grace_seconds),
+            grace: Duration::from_secs(cfg.stop_grace_seconds),
             backstop: Duration::from_secs(60),
             debounce: Duration::from_millis(400),
             exit_after: Duration::from_secs(120),
-            no_notify: false,
+            no_notify: !cfg.notify,
             verbose: false,
             quiet: false,
             once: false,
-            allow_cli_fallback: false,
+            allow_cli_fallback: cfg.allow_cli_fallback,
         };
 
         let mut args = std::env::args().skip(1);
