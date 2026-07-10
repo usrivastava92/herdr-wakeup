@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Action: show the current keep-awake decision and whether a background watcher runs.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$DIR/lib.sh"
+resolve_bins
+
+if pid="$(watcher_pid)"; then
+  echo "herdr-wakeup watcher: running (pid $pid)"
+else
+  echo "herdr-wakeup watcher: not running"
+fi
+"$WAKEUP_HERDR" --once

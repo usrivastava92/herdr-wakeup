@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Action: stop the background keep-awake watcher.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$DIR/lib.sh"
+
+if pid="$(watcher_pid)"; then
+  kill -TERM "$pid" 2>/dev/null || true
+  rm -f "$(pidfile)"
+  echo "stopped herdr-wakeup watcher (pid $pid)"
+else
+  rm -f "$(pidfile)" 2>/dev/null || true
+  echo "herdr-wakeup watcher is not running"
+fi

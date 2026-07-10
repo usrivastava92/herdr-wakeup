@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Action: start the keep-awake watcher in the background (no pane).
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$DIR/lib.sh"
+resolve_bins
+
+if pid="$(watcher_pid)"; then
+  echo "herdr-wakeup watcher already running (pid $pid)"
+  exit 0
+fi
+
+log="$(logfile)"
+# Detach fully so it survives this action returning. The watcher posts ☕/💤
+# toasts on transitions and releases wakeup on SIGTERM/SIGHUP.
+nohup "$WAKEUP_HERDR" >>"$log" 2>&1 &
+pid=$!
+write_pidfile "$pid" "$WAKEUP_HERDR"
+disown "$pid" 2>/dev/null || true
+sleep 0.2
+if ! watcher_pid >/dev/null; then
+  rm -f "$(pidfile)" 2>/dev/null || true
+  echo "failed to start herdr-wakeup watcher; see log: $log" >&2
+  exit 1
+fi
+echo "started herdr-wakeup watcher (pid $pid); log: $log"

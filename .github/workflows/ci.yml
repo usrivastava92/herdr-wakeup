@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    name: macOS
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Shellcheck
+        run: shellcheck plugin/bin/build plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop
+
+      - name: Release build
+        run: cargo build --release --workspace

@@ -1,0 +1,32 @@
+id = "herdr-wakeup"
+name = "Herdr Wakeup"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Keep macOS awake while Herdr agents are working, using the standalone wakeup binary."
+platforms = ["macos"]
+
+# Only runs on `herdr plugin install` (from GitHub), not on `plugin link`.
+# Builds the watcher binary from the plugin repo root.
+[[build]]
+command = ["bash", "bin/build"]
+
+# The watcher runs in the background (no pane). It posts a toast when it starts
+# holding the assertion and another toast when it releases, so herdr-wakeup never opens
+# or occupies a pane. Arm/disarm/check it with the actions below.
+[[actions]]
+id = "start"
+title = "Wakeup: start"
+contexts = ["global", "workspace", "pane"]
+command = ["bash", "bin/start"]
+
+[[actions]]
+id = "stop"
+title = "Wakeup: stop"
+contexts = ["global", "workspace", "pane"]
+command = ["bash", "bin/stop"]
+
+[[actions]]
+id = "status"
+title = "Wakeup: status"
+contexts = ["global", "workspace", "pane"]
+command = ["bash", "bin/status"]

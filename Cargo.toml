@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/wakeup-herdr"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
