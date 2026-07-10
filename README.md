@@ -5,6 +5,10 @@ A Herdr plugin that keeps macOS awake while Herdr-managed agents are working.
 This repo contains the Herdr-specific watcher and plugin wrapper.
 The standalone power assertion utility lives in the separate `wakeup` repo and must be installed separately.
 
+`wakeup-herdr` (this repo's watcher binary) is an **internal implementation detail of the plugin**, not a user-facing CLI.
+It is never installed to `PATH`: it is built in place inside this repo (`target/release/wakeup-herdr`) and the plugin's own action scripts find it there.
+The supported, user-facing interface is entirely `herdr plugin action invoke ...` (see below); running `wakeup-herdr` directly is only useful for local development/debugging of this plugin itself.
+
 ## What it does
 
 `herdr-wakeup` watches Herdr agent state.
@@ -22,14 +26,15 @@ No `herdr` process is spawned during normal operation; a CLI shellout only happe
 - `wakeup` installed on `PATH`.
 - Rust toolchain for source installs.
 
-## Build and install locally
+## Build and link locally
 
 ```bash
-make install
-make plugin-link
+make plugin-link   # builds target/release/wakeup-herdr, then `herdr plugin link`s this repo
 ```
 
-Then use the plugin actions:
+(`herdr plugin install <repo-url>`, the non-local/from-GitHub path, builds the same binary automatically via the plugin's own `bin/build` hook - no separate install step needed either way.)
+
+Then use the plugin actions - this is the supported, user-facing interface:
 
 ```bash
 herdr plugin action invoke start   --plugin herdr-wakeup
@@ -40,13 +45,15 @@ herdr plugin action invoke doctor  --plugin herdr-wakeup   # diagnostics: binari
 herdr plugin action invoke stop    --plugin herdr-wakeup
 ```
 
-## Running the watcher directly
+## Running the watcher directly (development only)
+
+`wakeup-herdr` is not installed on `PATH`; run it via its build path from this repo when developing/debugging the plugin itself:
 
 ```bash
-wakeup-herdr
-wakeup-herdr -d
-wakeup-herdr --once
-wakeup-herdr -v
+./target/release/wakeup-herdr
+./target/release/wakeup-herdr -d
+./target/release/wakeup-herdr --once
+./target/release/wakeup-herdr -v
 ```
 
 ## Options
@@ -94,17 +101,18 @@ While a snapshot fetch fails (`Error`), the watcher holds whatever it was alread
 
 Both are written atomically (temp file + rename), and a missing or corrupt file always falls back safely to defaults rather than crashing or blocking startup - a corrupt config is logged once and defaults to armed.
 
-`<key>` is a short hash derived from the resolved Herdr socket path (Herdr does not expose a session name to plugin action scripts), so concurrent Herdr sessions never share one watcher's config/state/pidfile/log. Run `wakeup-herdr paths` to see the resolved directories and key for the current socket.
+`<key>` is a short hash derived from the resolved Herdr socket path (Herdr does not expose a session name to plugin action scripts), so concurrent Herdr sessions never share one watcher's config/state/pidfile/log. Run `herdr plugin action invoke doctor --plugin herdr-wakeup` (or `./target/release/wakeup-herdr paths` locally) to see the resolved directories and key for the current socket.
 
-`armed` is re-read from config on every evaluation, not just at startup, so:
+`armed` is re-read from config on every evaluation, not just at startup. The supported way to flip it is the plugin actions:
 
 ```bash
-wakeup-herdr disarm   # pause: release any held assertion immediately, keep observing
-wakeup-herdr arm      # resume normal wake/sleep decisions
-wakeup-herdr state    # print the last-persisted runtime state (no running watcher needed)
-wakeup-herdr doctor   # one-shot diagnostic dump: socket reachability, config/state validity, pidfile identity
-wakeup-herdr paths    # print the resolved, session-scoped config/state directories
+herdr plugin action invoke disarm --plugin herdr-wakeup   # pause: release any held assertion immediately, keep observing
+herdr plugin action invoke arm    --plugin herdr-wakeup   # resume normal wake/sleep decisions
+herdr plugin action invoke status --plugin herdr-wakeup   # print the last-persisted runtime state
+herdr plugin action invoke doctor --plugin herdr-wakeup   # one-shot diagnostic dump: socket reachability, config/state validity, pidfile identity
 ```
+
+(The same subcommands - `arm`/`disarm`/`state`/`doctor`/`paths` - also exist directly on `./target/release/wakeup-herdr` for local development; the plugin actions just wrap them with pidfile/log context.)
 
 `disarm`/`arm` just flip and atomically save `config.json` - they work whether or not the watcher is running (so `disarm` survives a restart), and an already-running watcher picks up the change on its very next evaluation without a restart or signal.
 

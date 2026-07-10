@@ -11,17 +11,26 @@ resolve_bins() {
 
   export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
+  # `wakeup` is the separate, general-purpose, user-facing CLI (its own repo,
+  # meant to be installed on PATH). It is the only binary this plugin expects
+  # to find on PATH.
   WAKEUP="$(command -v wakeup 2>/dev/null || true)"
 
-  WAKEUP_HERDR="$(command -v wakeup-herdr 2>/dev/null || true)"
-  [ -z "$WAKEUP_HERDR" ] && [ -x "$repo/target/release/wakeup-herdr" ] && WAKEUP_HERDR="$repo/target/release/wakeup-herdr"
+  # `wakeup-herdr` is an internal implementation detail of *this* plugin, not
+  # a tool end users are meant to install or run directly. It is never
+  # looked up on PATH: it always resolves to the build artifact inside this
+  # plugin's own repo/install directory (produced by `bin/build` /
+  # `make build`, which `herdr plugin install` runs automatically). This
+  # keeps the user's PATH free of plugin-private tooling.
+  WAKEUP_HERDR=""
+  [ -x "$repo/target/release/wakeup-herdr" ] && WAKEUP_HERDR="$repo/target/release/wakeup-herdr"
 
   if [ -z "$WAKEUP" ]; then
     echo "herdr-wakeup: standalone wakeup binary not found on PATH. Install wakeup first." >&2
     return 1
   fi
   if [ -z "$WAKEUP_HERDR" ]; then
-    echo "herdr-wakeup: watcher binary not found. Build/install it first: (cd $repo && make install)" >&2
+    echo "herdr-wakeup: watcher binary not built yet. Build it first: (cd $repo && make build)" >&2
     return 1
   fi
   export WAKEUP WAKEUP_HERDR
