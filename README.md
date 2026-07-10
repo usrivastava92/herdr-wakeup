@@ -101,7 +101,27 @@ While a snapshot fetch fails (`Error`), the watcher holds whatever it was alread
 
 Both are written atomically (temp file + rename), and a missing or corrupt file always falls back safely to defaults rather than crashing or blocking startup - a corrupt config is logged once and defaults to armed.
 
-`<key>` is a short hash derived from the resolved Herdr socket path (Herdr does not expose a session name to plugin action scripts), so concurrent Herdr sessions never share one watcher's config/state/pidfile/log. Run `herdr plugin action invoke doctor --plugin herdr-wakeup` (or `./target/release/wakeup-herdr paths` locally) to see the resolved directories and key for the current socket.
+**`config.json` is bootstrapped automatically** (Herdr itself has no standard plugin-config-init mechanism - `herdr plugin config-dir <id>` only prints a path, it does not create anything - so this plugin does it itself): the first `start`, or the first `doctor`, writes the full set of defaults below to disk if the file doesn't already exist yet, so it's always present and hand-editable after that, not only as a side effect of `arm`/`disarm`. A file that already exists - valid or corrupt - is never touched or "repaired" automatically, so an in-progress edit is never clobbered.
+
+`<key>` is a short hash derived from the resolved Herdr socket path (Herdr does not expose a session name to plugin action scripts), so concurrent Herdr sessions never share one watcher's config/state/pidfile/log. Run `herdr plugin action invoke doctor --plugin herdr-wakeup` (or `./target/release/wakeup-herdr paths` locally) to see the resolved directories and key for the current socket; `herdr plugin config-dir herdr-wakeup` shows Herdr's own (non-session-scoped) root above it.
+
+### Configuration reference
+
+Every field in `config.json`, with its default and what it does. All of these mirror an equivalent CLI flag (see [Options](#options)); the config file only sets the *starting* value, and any CLI flag passed to `wakeup-herdr`/`./target/release/wakeup-herdr` always wins over it.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `armed` | bool | `true` | Whether the watcher makes wake/sleep decisions at all. Hot-reloaded every evaluation - the only field that takes effect on a *running* watcher without a restart (see `arm`/`disarm` above). |
+| `display` | bool | `false` | Also keep the display awake (runs `wakeup -di` instead of `wakeup -i`). Read once at startup only - changing it requires `stop` + `start`. |
+| `start_grace_seconds` | integer | `5` | How long an agent must stay `working` before the assertion is acquired; absorbs brief status flicker. |
+| `stop_grace_seconds` | integer | `30` | How long to keep the assertion after the last agent stops working, before releasing. |
+| `statuses` | array of strings | `["working"]` | Which Herdr agent statuses count as "active" for wake purposes. |
+| `notify` | bool | `true` | Post a toast notification on wake/sleep transitions. |
+| `wakeup_bin` | string | `"wakeup"` | Path/name of the standalone `wakeup` binary to spawn. |
+| `herdr_bin` | string | `"herdr"` | Path/name of the `herdr` binary, used only for `--once` and CLI fallback. |
+| `allow_cli_fallback` | bool | `false` | If the Herdr socket itself is unreachable, shell out to `herdr agent list` instead of just reporting unavailable. |
+
+`wakeup-herdr doctor` (and `herdr plugin action invoke doctor --plugin herdr-wakeup`) prints every one of these fields with their current effective value, so you never have to open the file just to see what's set.
 
 `armed` is re-read from config on every evaluation, not just at startup. The supported way to flip it is the plugin actions:
 

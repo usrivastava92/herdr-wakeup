@@ -68,14 +68,18 @@ OPTIONS:
 impl Opts {
     pub fn parse() -> Opts {
         // Config file values seed the defaults below (precedence: built-in <
-        // config file < env var < CLI flag). A missing config is normal and
-        // silent; a corrupt one falls back safely and is reported here, per
-        // Milestone 4's "corrupt config falls back safely and reports an
-        // error" acceptance criterion. `armed` itself is intentionally not
-        // read into Opts: the watcher re-reads it live on every evaluation
-        // (see App::reload_armed) so `disarm`/`arm` take effect without a
-        // restart, instead of only being read once at startup.
-        let (cfg, cfg_err) = persist::Config::load(&persist::config_path());
+        // config file < env var < CLI flag). A missing config file is
+        // bootstrapped with the full set of defaults right here (so it is
+        // immediately present and editable after the very first run, not
+        // only as a side effect of `arm`/`disarm`); a corrupt one falls back
+        // safely in memory and is reported, without touching the file on
+        // disk, per Milestone 4's "corrupt config falls back safely and
+        // reports an error" acceptance criterion. `armed` itself is
+        // intentionally not read into Opts: the watcher re-reads it live on
+        // every evaluation (see App::reload_armed) so `disarm`/`arm` take
+        // effect without a restart, instead of only being read once at
+        // startup.
+        let (cfg, cfg_err) = persist::Config::ensure_bootstrapped(&persist::config_path());
         if let Some(e) = &cfg_err {
             eprintln!("wakeup-herdr: config error (using defaults): {e}");
         }

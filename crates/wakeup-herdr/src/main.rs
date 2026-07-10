@@ -191,20 +191,30 @@ fn run_doctor() {
     let reachable = UnixStream::connect(&socket).is_ok();
     println!("  reachable: {}", if reachable { "yes" } else { "no" });
 
-    let (cfg, cfg_err) = persist::Config::load(&persist::config_path());
+    // Bootstraps config.json with full defaults if it doesn't exist yet, so
+    // `doctor` is also a safe way to make the file appear and inspect what
+    // it contains, even before ever running `start`/`arm`/`disarm`.
+    let (cfg, cfg_err) = persist::Config::ensure_bootstrapped(&persist::config_path());
     println!("config_dir:  {}", persist::config_dir().display());
+    println!("config_path: {}", persist::config_path().display());
     match &cfg_err {
-        Some(e) => println!("  config:    CORRUPT, using defaults ({e})"),
+        Some(e) => println!("  config:    CORRUPT, using defaults in memory ({e})"),
         None => println!("  config:    ok"),
     }
-    println!("  armed:     {}", cfg.armed);
+    println!("  armed:               {}", cfg.armed);
+    println!("  display:             {}", cfg.display);
+    println!("  start_grace_seconds: {}", cfg.start_grace_seconds);
+    println!("  stop_grace_seconds:  {}", cfg.stop_grace_seconds);
+    println!("  statuses:            {}", cfg.statuses.join(", "));
+    println!("  notify:              {}", cfg.notify);
+    println!("  allow_cli_fallback:  {}", cfg.allow_cli_fallback);
     println!(
-        "  wakeup_bin: {} ({})",
+        "  wakeup_bin:          {} ({})",
         cfg.wakeup_bin,
         bin_status(&cfg.wakeup_bin)
     );
     println!(
-        "  herdr_bin:  {} ({})",
+        "  herdr_bin:           {} ({})",
         cfg.herdr_bin,
         bin_status(&cfg.herdr_bin)
     );

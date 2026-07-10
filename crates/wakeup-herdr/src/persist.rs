@@ -157,6 +157,31 @@ impl Config {
         }
     }
 
+    /// Like [`Config::load`], but if `path` does not exist at all, writes
+    /// out the full set of defaults to it first (best-effort - a save
+    /// failure is folded into the returned error rather than blocking
+    /// startup) so the file is immediately present and editable after the
+    /// very first run, instead of only ever appearing as a side effect of
+    /// `arm`/`disarm`. Never overwrites a file that already exists, valid
+    /// or corrupt - a corrupt file is still reported as an error and never
+    /// touched on disk, so a user's in-progress edit is never clobbered.
+    pub fn ensure_bootstrapped(path: &Path) -> (Config, Option<String>) {
+        if path.exists() {
+            return Config::load(path);
+        }
+        let cfg = Config::default();
+        match cfg.save(path) {
+            Ok(()) => (cfg, None),
+            Err(e) => (
+                cfg,
+                Some(format!(
+                    "failed to write default config to {}: {e}",
+                    path.display()
+                )),
+            ),
+        }
+    }
+
     fn from_value(v: &Value) -> Config {
         let d = Config::default();
         let statuses = v
@@ -413,6 +438,68 @@ mod tests {
         assert_eq!(cfg, Config::default());
         assert!(err.is_some());
         let _ = fs::remove_file(&path);
+    }
+
+    /// The gap this closes: previously nothing wrote config.json until
+    /// `arm`/`disarm` was run, so a fresh install had no inspectable/
+    /// editable file at all. `ensure_bootstrapped` must create one, with the
+    /// full set of defaults, the first time anything calls it on a missing
+    /// path.
+    #[test]
+    fn ensure_bootstrapped_creates_file_with_full_defaults_when_missing() {
+        let path = tmp_path("bootstrap_missing.json");
+        assert!(!path.exists());
+
+        let (cfg, err) = Config::ensure_bootstrapped(&path);
+        assert!(err.is_none());
+        assert_eq!(cfg, Config::default());
+        assert!(path.exists(), "must have written the file to disk");
+
+        // What actually landed on disk must round-trip back to the same
+        // defaults, i.e. it is a real, complete, re-loadable config file -
+        // not just an in-memory default returned without being persisted.
+        let (reloaded, reload_err) = Config::load(&path);
+        assert!(reload_err.is_none());
+        assert_eq!(reloaded, Config::default());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Must never clobber a file that already exists, whether it holds
+    /// custom values or is outright corrupt - a user's own edits (or
+    /// in-progress edit) are never silently overwritten just by something
+    /// calling `ensure_bootstrapped`.
+    #[test]
+    fn ensure_bootstrapped_never_overwrites_an_existing_file() {
+        let path = tmp_path("bootstrap_existing.json");
+        let custom = Config {
+            armed: false,
+            display: true,
+            stop_grace_seconds: 999,
+            ..Config::default()
+        };
+        custom.save(&path).unwrap();
+
+        let (cfg, err) = Config::ensure_bootstrapped(&path);
+        assert!(err.is_none());
+        assert_eq!(
+            cfg, custom,
+            "must load the existing custom values, not defaults"
+        );
+        let _ = fs::remove_file(&path);
+
+        let path2 = tmp_path("bootstrap_corrupt.json");
+        fs::create_dir_all(path2.parent().unwrap()).unwrap();
+        fs::write(&path2, b"{ not valid json").unwrap();
+        let (cfg2, err2) = Config::ensure_bootstrapped(&path2);
+        assert!(err2.is_some(), "corrupt file must still be reported");
+        assert_eq!(cfg2, Config::default(), "falls back to defaults in memory");
+        let on_disk = fs::read_to_string(&path2).unwrap();
+        assert_eq!(
+            on_disk, "{ not valid json",
+            "the corrupt file on disk must be left untouched, not repaired/overwritten"
+        );
+        let _ = fs::remove_file(&path2);
     }
 
     #[test]
