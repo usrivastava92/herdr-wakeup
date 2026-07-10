@@ -514,6 +514,8 @@ struct App {
     state_path: PathBuf,
     config_error: Option<String>, // last config-load error, to log only on change
     last_transition_unix: u64,    // unix time of the last Acquire/Release
+    last_working: Vec<String>, // last snapshot's working-agent labels, for shutdown's write_state
+    last_total: usize,         // last snapshot's total agent count, for shutdown's write_state
 }
 
 enum Poll {
@@ -538,6 +540,8 @@ impl App {
             state_path: persist::state_path(),
             config_error: None,
             last_transition_unix: unix_now(),
+            last_working: Vec::new(),
+            last_total: 0,
         }
     }
 
@@ -687,8 +691,26 @@ impl App {
         now >= self.next_eval || self.sm.deadline().map(|r| now >= r).unwrap_or(false)
     }
 
+    /// Stops the `wakeup` child and, crucially, persists a final state
+    /// snapshot reflecting the release - without this, `state.json` keeps
+    /// whatever it last held from the previous `apply()` (e.g. `Awake`,
+    /// `assertion_active: true`), so `doctor`/`status` would misreport a
+    /// perfectly clean shutdown as a stale/crashed watcher (confirmed: this
+    /// happened for real - a clean stop's log line was correct, but the
+    /// persisted state kept alarming "may have crashed" language for as long
+    /// as nothing else overwrote it, since nothing ever did).
     fn shutdown(&mut self) {
         self.keeper.stop();
+        self.sm.force_off();
+        self.last_transition_unix = unix_now();
+        let armed = self.reload_armed();
+        let snap = Snapshot {
+            available: false,
+            working: std::mem::take(&mut self.last_working),
+            panes: BTreeSet::new(),
+            total: self.last_total,
+        };
+        self.write_state(&snap, armed);
         self.log("stopped; assertion released");
     }
 
@@ -787,6 +809,8 @@ impl App {
             }
         }
 
+        self.last_working = snap.working.clone();
+        self.last_total = snap.total;
         self.write_state(&snap, armed);
 
         // report pane-set change for re-subscribe
