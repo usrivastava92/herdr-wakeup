@@ -100,6 +100,11 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 // Config: user-tunable, persisted separately from runtime state.
 // --------------------------------------------------------------------------- //
 
+/// `wakeup` is looked up on `PATH` by default; `wakeup-herdr` (this binary)
+/// is not, on purpose - see the crate-level docs.
+pub const DEFAULT_WAKEUP_BIN: &str = "wakeup";
+pub const DEFAULT_HERDR_BIN: &str = "herdr";
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub armed: bool,
@@ -108,8 +113,16 @@ pub struct Config {
     pub stop_grace_seconds: u64,
     pub statuses: Vec<String>,
     pub notify: bool,
-    pub wakeup_bin: String,
-    pub herdr_bin: String,
+    /// Override for the `wakeup` binary path/name. `None` (the default, and
+    /// what a freshly bootstrapped config.json contains) means "resolve
+    /// `wakeup` on PATH" - there is no meaningful fixed default value to
+    /// show here, it's auto-detected, so it is deliberately omitted from
+    /// the JSON file unless a user adds it to override the lookup. Use
+    /// [`Config::effective_wakeup_bin`] to read the resolved value.
+    pub wakeup_bin: Option<String>,
+    /// Same as `wakeup_bin`, for the `herdr` binary. See
+    /// [`Config::effective_herdr_bin`].
+    pub herdr_bin: Option<String>,
     pub allow_cli_fallback: bool,
 }
 
@@ -122,8 +135,8 @@ impl Default for Config {
             stop_grace_seconds: 30,
             statuses: vec!["working".to_string()],
             notify: true,
-            wakeup_bin: "wakeup".to_string(),
-            herdr_bin: "herdr".to_string(),
+            wakeup_bin: None,
+            herdr_bin: None,
             allow_cli_fallback: false,
         }
     }
@@ -210,16 +223,19 @@ impl Config {
                 .unwrap_or(d.stop_grace_seconds),
             statuses,
             notify: v.get("notify").and_then(Value::as_bool).unwrap_or(d.notify),
+            // No `.unwrap_or(default)` here on purpose: unlike the other
+            // fields, `None` *is* the valid, distinct default - it means
+            // "auto-detect on PATH", not "value was missing so fall back to
+            // a fixed string". A present-but-wrong-type value still falls
+            // back to None (auto-detect) rather than erroring.
             wakeup_bin: v
                 .get("wakeup_bin")
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or(d.wakeup_bin),
+                .map(str::to_string),
             herdr_bin: v
                 .get("herdr_bin")
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or(d.herdr_bin),
+                .map(str::to_string),
             allow_cli_fallback: v
                 .get("allow_cli_fallback")
                 .and_then(Value::as_bool)
@@ -227,18 +243,55 @@ impl Config {
         }
     }
 
+    /// The resolved `wakeup` binary: the config override if one was set,
+    /// else the plain PATH-resolvable name.
+    pub fn effective_wakeup_bin(&self) -> String {
+        self.wakeup_bin
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WAKEUP_BIN.to_string())
+    }
+
+    /// The resolved `herdr` binary: the config override if one was set,
+    /// else the plain PATH-resolvable name.
+    pub fn effective_herdr_bin(&self) -> String {
+        self.herdr_bin
+            .clone()
+            .unwrap_or_else(|| DEFAULT_HERDR_BIN.to_string())
+    }
+
     fn to_value(&self) -> Value {
-        serde_json::json!({
-            "armed": self.armed,
-            "display": self.display,
-            "start_grace_seconds": self.start_grace_seconds,
-            "stop_grace_seconds": self.stop_grace_seconds,
-            "statuses": self.statuses,
-            "notify": self.notify,
-            "wakeup_bin": self.wakeup_bin,
-            "herdr_bin": self.herdr_bin,
-            "allow_cli_fallback": self.allow_cli_fallback,
-        })
+        // wakeup_bin/herdr_bin are deliberately omitted from the JSON
+        // entirely when unset (None), rather than serialized as null or as
+        // their resolved default string: they are auto-detected via PATH,
+        // not a real "default value" worth showing in a freshly bootstrapped
+        // file, and a bare override key is the clearest way to say "this is
+        // a user-added override" if someone does set one. Every other field
+        // is a genuine user preference with a meaningful default, so those
+        // stay always-present for discoverability (see `doctor`/README).
+        let mut map = serde_json::Map::new();
+        map.insert("armed".to_string(), serde_json::json!(self.armed));
+        map.insert("display".to_string(), serde_json::json!(self.display));
+        map.insert(
+            "start_grace_seconds".to_string(),
+            serde_json::json!(self.start_grace_seconds),
+        );
+        map.insert(
+            "stop_grace_seconds".to_string(),
+            serde_json::json!(self.stop_grace_seconds),
+        );
+        map.insert("statuses".to_string(), serde_json::json!(self.statuses));
+        map.insert("notify".to_string(), serde_json::json!(self.notify));
+        if let Some(bin) = &self.wakeup_bin {
+            map.insert("wakeup_bin".to_string(), serde_json::json!(bin));
+        }
+        if let Some(bin) = &self.herdr_bin {
+            map.insert("herdr_bin".to_string(), serde_json::json!(bin));
+        }
+        map.insert(
+            "allow_cli_fallback".to_string(),
+            serde_json::json!(self.allow_cli_fallback),
+        );
+        Value::Object(map)
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -463,6 +516,61 @@ mod tests {
         assert_eq!(reloaded, Config::default());
 
         let _ = fs::remove_file(&path);
+    }
+
+    /// The specific thing being asked for: a freshly bootstrapped
+    /// config.json must not contain `wakeup_bin`/`herdr_bin` keys at all
+    /// (they're auto-detected, not a real default value worth showing), but
+    /// setting one must make it appear in the saved JSON and round-trip back
+    /// as an override, and `effective_*` must reflect the resolution either
+    /// way.
+    #[test]
+    fn bin_override_fields_are_omitted_by_default_and_present_when_set() {
+        let path = tmp_path("bin_override_omitted.json");
+        let (cfg, _) = Config::ensure_bootstrapped(&path);
+        assert_eq!(cfg.wakeup_bin, None);
+        assert_eq!(cfg.herdr_bin, None);
+        assert_eq!(cfg.effective_wakeup_bin(), DEFAULT_WAKEUP_BIN);
+        assert_eq!(cfg.effective_herdr_bin(), DEFAULT_HERDR_BIN);
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("wakeup_bin"),
+            "default config.json must not mention wakeup_bin at all: {raw}"
+        );
+        assert!(
+            !raw.contains("herdr_bin"),
+            "default config.json must not mention herdr_bin at all: {raw}"
+        );
+        // Every other field is still expected to be present for
+        // discoverability - this is not a blanket "omit unset fields" rule.
+        assert!(raw.contains("armed"));
+        assert!(raw.contains("start_grace_seconds"));
+        let _ = fs::remove_file(&path);
+
+        let path2 = tmp_path("bin_override_present.json");
+        let custom = Config {
+            wakeup_bin: Some("/custom/wakeup".to_string()),
+            ..Config::default()
+        };
+        custom.save(&path2).unwrap();
+        let raw2 = fs::read_to_string(&path2).unwrap();
+        assert!(
+            raw2.contains("\"wakeup_bin\": \"/custom/wakeup\""),
+            "an explicit override must be written to disk: {raw2}"
+        );
+        assert!(
+            !raw2.contains("herdr_bin"),
+            "herdr_bin was never overridden, so it must still be omitted: {raw2}"
+        );
+
+        let (reloaded, err) = Config::load(&path2);
+        assert!(err.is_none());
+        assert_eq!(reloaded.wakeup_bin.as_deref(), Some("/custom/wakeup"));
+        assert_eq!(reloaded.effective_wakeup_bin(), "/custom/wakeup");
+        assert_eq!(reloaded.herdr_bin, None);
+        assert_eq!(reloaded.effective_herdr_bin(), DEFAULT_HERDR_BIN);
+        let _ = fs::remove_file(&path2);
     }
 
     /// Must never clobber a file that already exists, whether it holds

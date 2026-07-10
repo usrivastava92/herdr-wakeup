@@ -210,13 +210,13 @@ fn run_doctor() {
     println!("  allow_cli_fallback:  {}", cfg.allow_cli_fallback);
     println!(
         "  wakeup_bin:          {} ({})",
-        cfg.wakeup_bin,
-        bin_status(&cfg.wakeup_bin)
+        describe_bin_override(&cfg.wakeup_bin),
+        bin_status(&cfg.effective_wakeup_bin())
     );
     println!(
         "  herdr_bin:           {} ({})",
-        cfg.herdr_bin,
-        bin_status(&cfg.herdr_bin)
+        describe_bin_override(&cfg.herdr_bin),
+        bin_status(&cfg.effective_herdr_bin())
     );
 
     println!("state_dir:   {}", persist::state_dir().display());
@@ -240,6 +240,17 @@ fn run_doctor() {
         }
         (None, Some(e)) => println!("  state:     CORRUPT ({e})"),
         (None, None) => println!("  state:     none yet (watcher has never run)"),
+    }
+}
+
+/// Describes a `wakeup_bin`/`herdr_bin` config override for `doctor` output:
+/// `None` means the field is absent from config.json and PATH is used, which
+/// is the common case and worth saying explicitly rather than just printing
+/// the resolved name (which would look identical to an intentional override).
+fn describe_bin_override(bin: &Option<String>) -> String {
+    match bin {
+        Some(b) => format!("{b} (override, set in config.json)"),
+        None => "auto (resolved on PATH; not set in config.json)".to_string(),
     }
 }
 

@@ -89,8 +89,9 @@ impl Opts {
             .unwrap_or_else(|_| format!("{home}/.config/herdr/herdr.sock"));
         let default_herdr = std::env::var("HERDR_BIN_PATH")
             .or_else(|_| std::env::var("WAKEUP_HERDR_BIN"))
-            .unwrap_or(cfg.herdr_bin);
-        let default_wakeup = std::env::var("WAKEUP_BIN").unwrap_or(cfg.wakeup_bin);
+            .unwrap_or_else(|_| cfg.effective_herdr_bin());
+        let default_wakeup =
+            std::env::var("WAKEUP_BIN").unwrap_or_else(|_| cfg.effective_wakeup_bin());
 
         let mut o = Opts {
             socket: default_socket,

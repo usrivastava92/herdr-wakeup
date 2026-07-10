@@ -117,11 +117,25 @@ Every field in `config.json`, with its default and what it does. All of these mi
 | `stop_grace_seconds` | integer | `30` | How long to keep the assertion after the last agent stops working, before releasing. |
 | `statuses` | array of strings | `["working"]` | Which Herdr agent statuses count as "active" for wake purposes. |
 | `notify` | bool | `true` | Post a toast notification on wake/sleep transitions. |
-| `wakeup_bin` | string | `"wakeup"` | Path/name of the standalone `wakeup` binary to spawn. |
-| `herdr_bin` | string | `"herdr"` | Path/name of the `herdr` binary, used only for `--once` and CLI fallback. |
 | `allow_cli_fallback` | bool | `false` | If the Herdr socket itself is unreachable, shell out to `herdr agent list` instead of just reporting unavailable. |
+| `wakeup_bin` | string, **optional, absent by default** | resolved on `PATH` | Override the `wakeup` binary path/name. This key is *not* written into a freshly bootstrapped config.json - it's auto-detected via `PATH`, not a fixed default value worth showing, so it only appears if you add it yourself to point at a specific binary. |
+| `herdr_bin` | string, **optional, absent by default** | resolved on `PATH` | Same idea as `wakeup_bin`, for the `herdr` binary (used only for `--once` and CLI fallback). |
 
-`wakeup-herdr doctor` (and `herdr plugin action invoke doctor --plugin herdr-wakeup`) prints every one of these fields with their current effective value, so you never have to open the file just to see what's set.
+A freshly bootstrapped config.json therefore looks like this - 7 fields, no `wakeup_bin`/`herdr_bin` clutter:
+
+```json
+{
+  "allow_cli_fallback": false,
+  "armed": true,
+  "display": false,
+  "notify": true,
+  "start_grace_seconds": 5,
+  "statuses": ["working"],
+  "stop_grace_seconds": 30
+}
+```
+
+`wakeup-herdr doctor` (and `herdr plugin action invoke doctor --plugin herdr-wakeup`) prints every field above, including `wakeup_bin`/`herdr_bin`'s *effective* value even when absent from the file (`auto (resolved on PATH; not set in config.json)` vs `<path> (override, set in config.json)`), so you never have to open the file just to see what's in effect.
 
 `armed` is re-read from config on every evaluation, not just at startup. The supported way to flip it is the plugin actions:
 
