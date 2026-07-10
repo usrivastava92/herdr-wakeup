@@ -2,8 +2,9 @@
 //!
 //! Design: this is a small resident process that subscribes to Herdr's socket
 //! event stream (`pane.agent_status_changed` + pane lifecycle). On *any* event it
-//! re-queries the authoritative `herdr agent list` and feeds the result into a
-//! pure state machine (see `state.rs`):
+//! re-fetches an authoritative agent snapshot over the *same socket* (the
+//! `agent.list` RPC, not a CLI shellout) and feeds the result into a pure
+//! state machine (see `state.rs`):
 //!   - working starts, sustained past `--start-grace` -> acquire the `wakeup` assertion
 //!   - working stops, sustained past `--grace`         -> release it and let the machine sleep
 //!   - brief flickers in either direction do nothing, by design
@@ -11,7 +12,9 @@
 //! It never tracks per-agent state and never parses event payloads; an event is
 //! just a "re-evaluate now" trigger. Policy lives here, mechanism lives in the
 //! `wakeup` binary (spawned as `wakeup -i -w <our-pid>`, so it self-releases if we
-//! ever die). If the socket is unavailable it transparently falls back to polling.
+//! ever die). No `herdr` process is spawned during normal operation; a CLI
+//! shellout only happens for `--once`, or if `--allow-cli-fallback` is set and
+//! the socket itself is unreachable.
 //!
 //! It runs in the background (no pane) and surfaces state as toast notifications
 //! on transitions: "☕ Keeping awake" when it starts holding the assertion and
@@ -58,7 +61,7 @@ fn main() {
     let o = Opts::parse();
 
     if o.once {
-        let snap = herdr_agents(&o);
+        let snap = herdr_agents_cli(&o);
         report_once(&snap, &o);
         return;
     }
@@ -88,44 +91,43 @@ struct Snapshot {
     total: usize,
 }
 
-fn herdr_agents(o: &Opts) -> Snapshot {
+impl Snapshot {
+    fn unavailable() -> Self {
+        Snapshot {
+            available: false,
+            working: vec![],
+            panes: BTreeSet::new(),
+            total: 0,
+        }
+    }
+}
+
+/// CLI fallback: shells out to `herdr agent list`. Used only for `--once`,
+/// diagnostics, and (opt-in) `--allow-cli-fallback` when the socket itself is
+/// unreachable. Normal event-driven operation uses `agent_list_via_socket`
+/// instead, so no Herdr process is spawned per evaluation.
+fn herdr_agents_cli(o: &Opts) -> Snapshot {
     let out = run_capture(&o.herdr_bin, &["agent", "list"], Duration::from_secs(8));
     let out = match out {
         Some(s) if !s.trim().is_empty() => s,
-        _ => {
-            return Snapshot {
-                available: false,
-                working: vec![],
-                panes: BTreeSet::new(),
-                total: 0,
-            }
-        }
+        _ => return Snapshot::unavailable(),
     };
-    let val: serde_json::Value = match serde_json::from_str(&out) {
-        Ok(v) => v,
-        Err(_) => {
-            return Snapshot {
-                available: false,
-                working: vec![],
-                panes: BTreeSet::new(),
-                total: 0,
-            }
-        }
-    };
-    let agents = val
+    match serde_json::from_str::<serde_json::Value>(&out) {
+        Ok(v) => snapshot_from_response(&v, o),
+        Err(_) => Snapshot::unavailable(),
+    }
+}
+
+/// Parse the `{"result": {"agents": [...]}}` shape shared by both the
+/// `herdr agent list` CLI output and the socket `agent.list` RPC reply.
+fn snapshot_from_response(v: &serde_json::Value, o: &Opts) -> Snapshot {
+    let agents = v
         .get("result")
         .and_then(|r| r.get("agents"))
         .and_then(|a| a.as_array());
     let agents = match agents {
         Some(a) => a,
-        None => {
-            return Snapshot {
-                available: false,
-                working: vec![],
-                panes: BTreeSet::new(),
-                total: 0,
-            }
-        }
+        None => return Snapshot::unavailable(),
     };
     let mut working = Vec::new();
     let mut panes = BTreeSet::new();
@@ -147,6 +149,33 @@ fn herdr_agents(o: &Opts) -> Snapshot {
         working,
         panes,
         total: agents.len(),
+    }
+}
+
+/// The RPC id used for socket `agent.list` requests, per the improvement
+/// plan's `herdr-wakeup:agent:list` convention.
+const AGENT_LIST_ID: &str = "herdr-wakeup:agent:list";
+
+/// Fetch a snapshot using an already-connected socket. Split out from
+/// `agent_list_via_socket` so it is unit-testable with an in-memory
+/// `UnixStream::pair()` instead of a real bound socket path.
+fn agent_list_via_conn(conn: &mut Conn, o: &Opts, timeout: Duration) -> Snapshot {
+    match conn.agent_list(AGENT_LIST_ID, timeout) {
+        Some(v) => snapshot_from_response(&v, o),
+        None => Snapshot::unavailable(),
+    }
+}
+
+/// Fetch one snapshot over a fresh, short-lived socket connection instead of
+/// shelling out to `herdr agent list`. The Herdr socket protocol is
+/// single-request-per-connection (verified empirically: the server closes
+/// the connection after answering one RPC, except when the request is
+/// `events.subscribe`, which stays open to push events) - so every snapshot
+/// gets its own connection rather than reusing the subscription's `Conn`.
+fn agent_list_via_socket(o: &Opts, timeout: Duration) -> Snapshot {
+    match UnixStream::connect(&o.socket) {
+        Ok(stream) => agent_list_via_conn(&mut Conn::new(stream), o, timeout),
+        Err(_) => Snapshot::unavailable(),
     }
 }
 
@@ -279,38 +308,25 @@ impl App {
 
     fn run(&mut self) {
         while !stopping() && !self.herdr_gone {
-            let panes = herdr_agents(&self.o).panes;
-            match self.connect_subscribe(&panes) {
-                Some(mut stream) => {
-                    self.subscribed = panes;
-                    self.evaluate("connected");
-                    if self.herdr_gone {
-                        break;
-                    }
-                    self.next_eval = Instant::now() + self.o.backstop;
-                    self.stream_loop(&mut stream);
-                    // fell out: reconnect (or stopping)
-                }
-                None => {
-                    // No socket subscription right now: do one polling evaluation,
-                    // then fall back to the outer loop and retry connect_subscribe,
-                    // so event-driven mode is restored as soon as Herdr is reachable
-                    // again (e.g. after a quick server restart). Retry sooner while
-                    // Herdr is unreachable; otherwise at the backstop interval.
-                    self.evaluate("poll");
-                    if self.herdr_gone {
-                        break;
-                    }
-                    let nap = if self.unavailable_since.is_some() {
-                        Duration::from_secs(5)
-                    } else {
-                        self.o.backstop
-                    };
-                    let deadline = Instant::now() + nap;
-                    while !stopping() && !self.herdr_gone && Instant::now() < deadline {
-                        let left = deadline.saturating_duration_since(Instant::now());
-                        std::thread::sleep(Duration::from_millis(500).min(left));
-                    }
+            let had_session = self.run_socket_session();
+            if self.herdr_gone {
+                break;
+            }
+            if !had_session {
+                // No event-driven session ran this round (couldn't connect, or
+                // the bootstrap agent.list/subscribe failed): retry sooner
+                // while Herdr is unreachable, otherwise at the backstop
+                // interval, so event-driven mode resumes as soon as Herdr is
+                // reachable again (e.g. after a quick server restart).
+                let nap = if self.unavailable_since.is_some() {
+                    Duration::from_secs(5)
+                } else {
+                    self.o.backstop
+                };
+                let deadline = Instant::now() + nap;
+                while !stopping() && !self.herdr_gone && Instant::now() < deadline {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(Duration::from_millis(500).min(left));
                 }
             }
             if stopping() || self.herdr_gone {
@@ -321,8 +337,65 @@ impl App {
         self.shutdown();
     }
 
-    /// Read events until the pane set changes, the connection drops, or we stop.
-    fn stream_loop(&mut self, stream: &mut Conn) {
+    /// Snapshot, subscribe, and run one event-driven session. No `herdr`
+    /// process is spawned in this path (see `agent_list_via_socket`). Returns
+    /// true iff a session actually ran, so the caller can reconnect quickly
+    /// instead of using the longer "unreachable" nap.
+    fn run_socket_session(&mut self) -> bool {
+        // Bootstrap: learn current panes and the initial working set over a
+        // short-lived socket connection, so no CLI shellout is needed just to
+        // build the per-pane subscription list.
+        let snap = self.snapshot();
+        if !snap.available {
+            self.apply(snap, "connect");
+            return false;
+        }
+
+        // The subscription connection is separate and long-lived: the Herdr
+        // socket protocol only answers one request per connection, except
+        // `events.subscribe`, which keeps the connection open to push events.
+        let stream = match UnixStream::connect(&self.o.socket) {
+            Ok(s) => s,
+            Err(_) => {
+                self.apply(Snapshot::unavailable(), "connect");
+                return false;
+            }
+        };
+        let mut conn = Conn::new(stream);
+        if !self.subscribe(&mut conn, &snap.panes) {
+            // Still apply this snapshot even though the subscription ack
+            // failed, so a transient subscribe hiccup doesn't also cost us a
+            // decision this round.
+            self.apply(snap, "connect");
+            return false;
+        }
+
+        self.subscribed = snap.panes.clone();
+        self.apply(snap, "connected");
+        if self.herdr_gone {
+            return true;
+        }
+        self.next_eval = Instant::now() + self.o.backstop;
+        self.stream_loop(&mut conn);
+        true
+    }
+
+    /// Fetch a fresh snapshot: the socket `agent.list` RPC is the primary
+    /// path (a new short-lived connection every time), falling back to the
+    /// CLI only when `--allow-cli-fallback` is set and the socket itself
+    /// didn't answer.
+    fn snapshot(&self) -> Snapshot {
+        let snap = agent_list_via_socket(&self.o, Duration::from_secs(5));
+        if snap.available || !self.o.allow_cli_fallback {
+            snap
+        } else {
+            herdr_agents_cli(&self.o)
+        }
+    }
+
+    /// Read events on the subscription connection until the pane set
+    /// changes, the connection drops, or we stop.
+    fn stream_loop(&mut self, conn: &mut Conn) {
         loop {
             if stopping() {
                 return;
@@ -330,7 +403,7 @@ impl App {
             // Wake at least once a second so we notice signals promptly, but
             // only re-query Herdr on real events or when a deadline elapses.
             let to = Duration::from_millis(1000).min(self.until_deadline());
-            match stream.wait(to) {
+            match conn.wait(to) {
                 Poll::Closed => {
                     self.log("socket closed; reconnecting");
                     return;
@@ -340,7 +413,8 @@ impl App {
                         return;
                     }
                     if self.deadline_passed() {
-                        self.evaluate("tick");
+                        let snap = self.snapshot();
+                        self.apply(snap, "tick");
                         if self.herdr_gone {
                             return;
                         }
@@ -348,8 +422,9 @@ impl App {
                     }
                 }
                 Poll::Activity => {
-                    stream.drain(self.o.debounce);
-                    let changed = self.evaluate("event");
+                    conn.drain(self.o.debounce);
+                    let snap = self.snapshot();
+                    let changed = self.apply(snap, "event");
                     if self.herdr_gone {
                         return;
                     }
@@ -382,10 +457,10 @@ impl App {
         self.log("stopped; assertion released");
     }
 
-    /// Re-query Herdr and toggle wakeup. Returns true if the pane set changed
-    /// (so the caller knows to re-subscribe).
-    fn evaluate(&mut self, reason: &str) -> bool {
-        let snap = herdr_agents(&self.o);
+    /// Feed an already-fetched snapshot into the state machine and toggle
+    /// wakeup accordingly. Returns true if the pane set changed (so the
+    /// caller knows to re-subscribe).
+    fn apply(&mut self, snap: Snapshot, reason: &str) -> bool {
         let now = Instant::now();
 
         // Tie our lifecycle to the Herdr server: if it stays unreachable past the
@@ -478,11 +553,9 @@ impl App {
         );
     }
 
-    /// Connect to the socket and subscribe to lifecycle + per-pane agent status.
-    fn connect_subscribe(&self, panes: &BTreeSet<String>) -> Option<Conn> {
-        let stream = UnixStream::connect(&self.o.socket).ok()?;
-        let mut conn = Conn::new(stream);
-
+    /// Subscribe to lifecycle + per-pane agent status events on an already-
+    /// connected socket. Returns true iff the subscription was acknowledged.
+    fn subscribe(&self, conn: &mut Conn, panes: &BTreeSet<String>) -> bool {
         let mut subs = vec![
             serde_json::json!({"type": "pane.created"}),
             serde_json::json!({"type": "pane.exited"}),
@@ -496,12 +569,11 @@ impl App {
             "method": "events.subscribe",
             "params": {"subscriptions": subs},
         });
-        conn.send(&req).ok()?;
-        // Expect the explicit subscription_started ack within a short window.
-        match conn.recv_json(Duration::from_secs(3)) {
-            Some(v) if subscription_started(&v) => Some(conn),
-            _ => None,
+        if conn.send(&req).is_err() {
+            return false;
         }
+        // Expect the explicit subscription_started ack within a short window.
+        matches!(conn.recv_json(Duration::from_secs(3)), Some(v) if subscription_started(&v))
     }
 }
 
@@ -559,6 +631,27 @@ impl Conn {
                 Poll::Closed
             ) {
                 return None;
+            }
+        }
+    }
+
+    /// Send an `agent.list` RPC and wait for the reply matching `id`, per
+    /// Milestone 3 of the improvement plan (socket snapshots instead of
+    /// shelling out to `herdr agent list`). Any other message received while
+    /// waiting (e.g. a subscription event arriving mid-request) is ignored:
+    /// we are about to have a fresh snapshot anyway, so nothing is lost.
+    fn agent_list(&mut self, id: &str, timeout: Duration) -> Option<serde_json::Value> {
+        let req = serde_json::json!({"id": id, "method": "agent.list", "params": {}});
+        self.send(&req).ok()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let v = self.recv_json(deadline.saturating_duration_since(now))?;
+            if v.get("id").and_then(|i| i.as_str()) == Some(id) {
+                return Some(v);
             }
         }
     }
@@ -748,5 +841,130 @@ mod tests {
 
         let second = conn.recv_json(Duration::from_secs(1)).unwrap();
         assert_eq!(second.get("two").and_then(|v| v.as_i64()), Some(2));
+    }
+
+    fn test_opts(statuses: &[&str]) -> Opts {
+        Opts {
+            socket: String::new(),
+            herdr_bin: "herdr".into(),
+            wakeup_bin: "wakeup".into(),
+            display: false,
+            statuses: statuses.iter().map(|s| s.to_string()).collect(),
+            start_grace: Duration::from_secs(5),
+            grace: Duration::from_secs(30),
+            backstop: Duration::from_secs(60),
+            debounce: Duration::from_millis(400),
+            exit_after: Duration::from_secs(120),
+            no_notify: true,
+            verbose: false,
+            quiet: true,
+            once: false,
+            allow_cli_fallback: false,
+        }
+    }
+
+    /// The real shape returned by the socket `agent.list` RPC, captured live
+    /// against a running Herdr server (also matches the CLI's JSON output
+    /// under the same `result.agents` path).
+    fn sample_agent_list_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "herdr-wakeup:agent:list",
+            "result": {
+                "type": "agent_list",
+                "agents": [
+                    {
+                        "terminal_id": "term_1",
+                        "agent": "claude",
+                        "agent_status": "working",
+                        "pane_id": "w4:p14",
+                        "cwd": "/Users/x/workspace/ai-forge-builder",
+                        "foreground_cwd": "/Users/x/workspace/ai-forge-builder"
+                    },
+                    {
+                        "terminal_id": "term_2",
+                        "agent": "codex",
+                        "agent_status": "idle",
+                        "pane_id": "w4:p15",
+                        "cwd": "/Users/x/workspace/other",
+                        "foreground_cwd": "/Users/x/workspace/other"
+                    }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn snapshot_from_response_parses_real_agent_list_shape() {
+        let o = test_opts(&["working"]);
+        let snap = snapshot_from_response(&sample_agent_list_response(), &o);
+        assert!(snap.available);
+        assert_eq!(snap.total, 2);
+        assert_eq!(snap.working, vec!["claude@ai-forge-builder".to_string()]);
+        assert_eq!(
+            snap.panes,
+            BTreeSet::from(["w4:p14".to_string(), "w4:p15".to_string()])
+        );
+    }
+
+    #[test]
+    fn snapshot_from_response_honors_custom_statuses() {
+        let o = test_opts(&["working", "idle"]);
+        let snap = snapshot_from_response(&sample_agent_list_response(), &o);
+        assert_eq!(snap.working.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_from_response_rejects_malformed_payloads_without_panicking() {
+        let o = test_opts(&["working"]);
+        for bad in [
+            serde_json::json!({"unexpected": "shape"}),
+            serde_json::json!({"result": {}}),
+            serde_json::json!({"result": {"agents": "not-an-array"}}),
+            serde_json::json!(null),
+        ] {
+            let snap = snapshot_from_response(&bad, &o);
+            assert!(!snap.available);
+            assert_eq!(snap.total, 0);
+        }
+    }
+
+    #[test]
+    fn agent_list_via_conn_ignores_unrelated_events_first() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let mut conn = Conn::new(client);
+
+        // Simulate a subscription event arriving just before our RPC reply.
+        server
+            .write_all(b"{\"type\":\"pane.created\",\"pane_id\":\"w1:p1\"}\n")
+            .unwrap();
+        let response = sample_agent_list_response();
+        server
+            .write_all(format!("{}\n", response).as_bytes())
+            .unwrap();
+
+        let o = test_opts(&["working"]);
+        let snap = agent_list_via_conn(&mut conn, &o, Duration::from_secs(2));
+        assert!(snap.available);
+        assert_eq!(snap.total, 2);
+    }
+
+    #[test]
+    fn agent_list_via_conn_reports_unavailable_on_timeout() {
+        let (client, _server) = UnixStream::pair().unwrap();
+        let mut conn = Conn::new(client);
+        let o = test_opts(&["working"]);
+        // Nothing is ever written by the peer, so this should time out cleanly.
+        let snap = agent_list_via_conn(&mut conn, &o, Duration::from_millis(200));
+        assert!(!snap.available);
+    }
+
+    #[test]
+    fn agent_list_via_socket_reports_unavailable_when_socket_path_is_bogus() {
+        let o = Opts {
+            socket: "/tmp/tmp_rovo_nonexistent_herdr_socket_for_tests.sock".into(),
+            ..test_opts(&["working"])
+        };
+        let snap = agent_list_via_socket(&o, Duration::from_millis(200));
+        assert!(!snap.available);
     }
 }

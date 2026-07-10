@@ -21,6 +21,10 @@ pub struct Opts {
     pub verbose: bool,
     pub quiet: bool,
     pub once: bool,
+    /// If the Herdr socket itself is unreachable, shell out to `herdr agent
+    /// list` instead of just reporting "unavailable". Off by default: normal
+    /// operation never spawns a Herdr process (see Milestone 3).
+    pub allow_cli_fallback: bool,
 }
 
 const USAGE: &str = "\
@@ -29,10 +33,11 @@ wakeup-herdr - keep macOS awake while a Herdr agent is working (event-driven)
 USAGE:
     wakeup-herdr [options]
 
-It subscribes to Herdr's socket event stream and, on any agent status change,
-re-queries `herdr agent list`: if any agent is `working` it runs `wakeup`,
-otherwise it lets the machine sleep. Falls back to polling if the socket is
-unavailable.
+It connects to Herdr's socket, subscribes to lifecycle + agent status events,
+and fetches snapshots via the socket agent.list RPC (no herdr process is
+spawned during normal operation): if any agent is working it runs wakeup,
+otherwise it lets the machine sleep. If the socket itself is unreachable it
+just reports unavailable and retries, unless --allow-cli-fallback is set.
 
 OPTIONS:
     -d, --display        Also keep the display awake (runs `wakeup -di`).
@@ -45,8 +50,9 @@ OPTIONS:
     --socket <path>      Herdr socket path (default: $HERDR_SOCKET_PATH or ~/.config/herdr/herdr.sock).
     --wakeup <path>      Path to the wakeup binary (default: $WAKEUP_BIN or `wakeup`).
     --herdr <path>       Path to the herdr binary (default: $HERDR_BIN_PATH or `herdr`).
-    --no-notify          Do not post ☕/💤 wake/sleep toast notifications.
-    --once               Print the current decision and exit (debug).
+    --allow-cli-fallback Shell out to `herdr agent list` if the socket itself is unreachable.
+    --no-notify          Do not post wake/sleep toast notifications.
+    --once               Print the current decision and exit (debug; always uses the CLI).
     -v, --verbose        Log every evaluation.
     -q, --quiet          Suppress routine logging.
     -h, --help           Show this help.
@@ -78,6 +84,7 @@ impl Opts {
             verbose: false,
             quiet: false,
             once: false,
+            allow_cli_fallback: false,
         };
 
         let mut args = std::env::args().skip(1);
@@ -110,6 +117,7 @@ impl Opts {
                 "--socket" => o.socket = val(args.next(), "--socket"),
                 "--wakeup" => o.wakeup_bin = val(args.next(), "--wakeup"),
                 "--herdr" => o.herdr_bin = val(args.next(), "--herdr"),
+                "--allow-cli-fallback" => o.allow_cli_fallback = true,
                 "--no-notify" => o.no_notify = true,
                 "--once" => o.once = true,
                 "-v" | "--verbose" => o.verbose = true,

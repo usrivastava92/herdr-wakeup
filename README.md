@@ -12,7 +12,8 @@ When at least one agent is `working`, it runs `wakeup` to hold a macOS power ass
 When agents stop working, it releases the assertion after a short grace period.
 
 The watcher is event-driven.
-It subscribes to Herdr socket events, re-checks agent state on changes, and uses a slow backstop tick only for recovery.
+It subscribes to Herdr socket events, re-checks agent state on changes via the socket `agent.list` RPC, and uses a slow backstop tick only for recovery.
+No `herdr` process is spawned during normal operation; a CLI shellout only happens for `--once`, or if `--allow-cli-fallback` is set and the socket itself is unreachable.
 
 ## Requirements
 
@@ -58,7 +59,8 @@ wakeup-herdr -v
 | `--statuses <list>` | `working` | Comma-separated statuses that count as active. |
 | `--socket <path>` | `$HERDR_SOCKET_PATH` | Herdr socket path. |
 | `--wakeup <path>` | `wakeup` | Path to the standalone `wakeup` binary. |
-| `--herdr <path>` | `herdr` | Path to the Herdr binary. |
+| `--herdr <path>` | `herdr` | Path to the Herdr binary (used only for `--once` and CLI fallback). |
+| `--allow-cli-fallback` | off | Shell out to `herdr agent list` if the socket itself is unreachable. |
 | `--no-notify` | off | Do not post wake/sleep toast notifications. |
 
 ## State machine
