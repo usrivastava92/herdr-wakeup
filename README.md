@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/banner.png" alt="herdr-wakeup" width="100%" />
+  <img src="assets/banner.png" alt="herdr-wakeup keeps your machine awake while Herdr agents work and restores normal sleep when they finish" width="100%" />
   <h1>herdr-wakeup</h1>
   <p><strong>Keep macOS or Linux awake while Herdr-managed agents are working.</strong></p>
   <p>
