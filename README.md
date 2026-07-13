@@ -1,10 +1,15 @@
-# herdr-wakeup
+<div align="center">
+  <img src="assets/banner.png" alt="herdr-wakeup keeps your machine awake while Herdr agents work and restores normal sleep when they finish" width="100%" />
+  <h1>herdr-wakeup</h1>
+  <p><strong>Keep macOS or Linux awake while Herdr-managed agents are working.</strong></p>
+  <p>
+    <a href="https://github.com/usrivastava92/herdr-wakeup/actions/workflows/ci.yml"><img src="https://github.com/usrivastava92/herdr-wakeup/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+    <a href="https://github.com/usrivastava92/herdr-wakeup/releases/latest"><img src="https://img.shields.io/github/v/release/usrivastava92/herdr-wakeup" alt="Release" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/usrivastava92/herdr-wakeup" alt="License" /></a>
+  </p>
+</div>
 
-[![CI](https://github.com/usrivastava92/herdr-wakeup/actions/workflows/ci.yml/badge.svg)](https://github.com/usrivastava92/herdr-wakeup/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/usrivastava92/herdr-wakeup)](https://github.com/usrivastava92/herdr-wakeup/releases/latest)
-[![License](https://img.shields.io/github/license/usrivastava92/herdr-wakeup)](LICENSE)
-
-Keep macOS or Linux awake while Herdr-managed agents are working.
+---
 
 `herdr-wakeup` watches the current Herdr session and holds a system wake assertion whenever an agent remains in the `working` state.
 It releases the assertion after work stops, while allowing the display to sleep by default.
