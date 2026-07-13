@@ -1,20 +1,25 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
 
 jobs:
   macos:
-    name: macOS
-    runs-on: macos-latest
+    name: macOS 14
+    runs-on: macos-14
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           components: clippy, rustfmt
 
@@ -25,13 +30,104 @@ jobs:
         run: cargo fmt --check
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Shellcheck
-        run: shellcheck plugin/bin/build plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop
+        run: shellcheck --source-path=SCRIPTDIR -x plugin/bin/arm plugin/bin/build plugin/bin/disarm plugin/bin/doctor plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop plugin/bin/vendor-wakeup
+
+      - name: Offline vendor verify
+        run: plugin/bin/vendor-wakeup --verify
+
+      - name: Modes and architecture
+        run: |
+          test "$(stat -f '%Lp' plugin/vendor/macos-arm64/wakeup)" = 755
+          test "$(stat -f '%Lp' plugin/vendor/macos-x86_64/wakeup)" = 755
+          test "$(stat -f '%Lp' plugin/vendor/linux-arm64/wakeup)" = 755
+          test "$(stat -f '%Lp' plugin/vendor/linux-x86_64/wakeup)" = 755
+          test "$(stat -f '%Lp' plugin/vendor/windows-x86_64/wakeup.exe)" = 644
+          file plugin/vendor/macos-arm64/wakeup plugin/vendor/macos-x86_64/wakeup plugin/vendor/linux-arm64/wakeup plugin/vendor/linux-x86_64/wakeup plugin/vendor/windows-x86_64/wakeup.exe
+
+      - name: Native wakeup smoke
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, subprocess, sys
+          provenance = json.loads(pathlib.Path('plugin/vendor/provenance.json').read_text())
+          version = provenance['release_tag'].lstrip('v')
+          expected = f'wakeup {version}'
+          out = subprocess.run([
+              'plugin/vendor/macos-arm64/wakeup',
+              '--version',
+          ], check=True, capture_output=True, text=True).stdout.strip()
+          if out != expected:
+              print(f'expected: {expected}')
+              print(f'actual:   {out}')
+              sys.exit(1)
+          PY
 
       - name: Release build
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
+
+  linux:
+    name: Linux 24.04
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: clippy, rustfmt
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck file
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Shellcheck
+        run: shellcheck --source-path=SCRIPTDIR -x plugin/bin/arm plugin/bin/build plugin/bin/disarm plugin/bin/doctor plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop plugin/bin/vendor-wakeup
+
+      - name: Offline vendor verify
+        run: plugin/bin/vendor-wakeup --verify
+
+      - name: Modes and architecture
+        run: |
+          test "$(stat -c '%a' plugin/vendor/macos-arm64/wakeup)" = 755
+          test "$(stat -c '%a' plugin/vendor/macos-x86_64/wakeup)" = 755
+          test "$(stat -c '%a' plugin/vendor/linux-arm64/wakeup)" = 755
+          test "$(stat -c '%a' plugin/vendor/linux-x86_64/wakeup)" = 755
+          test "$(stat -c '%a' plugin/vendor/windows-x86_64/wakeup.exe)" = 644
+          file plugin/vendor/macos-arm64/wakeup plugin/vendor/macos-x86_64/wakeup plugin/vendor/linux-arm64/wakeup plugin/vendor/linux-x86_64/wakeup plugin/vendor/windows-x86_64/wakeup.exe
+
+      - name: Native wakeup smoke
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, subprocess, sys
+          provenance = json.loads(pathlib.Path('plugin/vendor/provenance.json').read_text())
+          version = provenance['release_tag'].lstrip('v')
+          expected = f'wakeup {version}'
+          out = subprocess.run([
+              'plugin/vendor/linux-x86_64/wakeup',
+              '--version',
+          ], check=True, capture_output=True, text=True).stdout.strip()
+          if out != expected:
+              print(f'expected: {expected}')
+              print(f'actual:   {out}')
+              sys.exit(1)
+          PY
+
+      - name: Release build
+        run: cargo build --release --workspace --locked

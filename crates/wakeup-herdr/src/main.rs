@@ -1,4 +1,4 @@
-//! wakeup-herdr - a Herdr plugin that keeps macOS awake while agents are working.
+//! wakeup-herdr - a Herdr plugin that keeps macOS and Linux awake while agents are working.
 //!
 //! Design: this is a small resident process that subscribes to Herdr's socket
 //! event stream (`pane.agent_status_changed` + pane lifecycle). On *any* event it

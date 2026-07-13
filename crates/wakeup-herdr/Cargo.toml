@@ -2,7 +2,7 @@
 name = "wakeup-herdr"
 version = "0.1.0"
 edition = "2021"
-description = "Herdr plugin: keeps macOS awake (via the wakeup binary) while any Herdr-managed agent is working."
+description = "Herdr plugin: keeps macOS and Linux awake (via the wakeup binary) while any Herdr-managed agent is working."
 license = "MIT"
 readme = "../../README.md"
 categories = ["command-line-utilities"]

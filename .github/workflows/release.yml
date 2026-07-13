@@ -1,0 +1,331 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish"
+        required: true
+
+concurrency:
+  group: herdr-wakeup-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_REPOSITORY: usrivastava92/herdr-wakeup
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    outputs:
+      tested_sha: ${{ steps.capture.outputs.tested_sha }}
+      publish_needed: ${{ steps.preflight.outputs.publish_needed }}
+    steps:
+      - name: Guard repository and ref
+        run: |
+          test "${GITHUB_REPOSITORY}" = "${EXPECTED_REPOSITORY}"
+          test "${GITHUB_REF}" = "refs/heads/main"
+
+      - name: Checkout main
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+          ref: main
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: clippy, rustfmt
+
+      - name: Capture SHA
+        id: capture
+        run: echo "tested_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tag input
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', os.environ['RELEASE_TAG']):
+              sys.exit(1)
+          PY
+
+      - name: Validate versions and notes
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, sys, tomllib
+          tag = os.environ['RELEASE_TAG']
+          version = tag[1:]
+          notes = pathlib.Path(f'.github/release-notes/{tag}.md')
+          if not notes.is_file():
+              sys.exit(1)
+          cargo = tomllib.loads(pathlib.Path('crates/wakeup-herdr/Cargo.toml').read_text())
+          lock = tomllib.loads(pathlib.Path('Cargo.lock').read_text())
+          plugin = tomllib.loads(pathlib.Path('plugin/herdr-plugin.toml').read_text())
+          pkg = next((p for p in lock['package'] if p['name'] == 'wakeup-herdr'), None)
+          if cargo['package']['version'] != version:
+              sys.exit(1)
+          if plugin['version'] != version:
+              sys.exit(1)
+          if pkg is None or pkg['version'] != version:
+              sys.exit(1)
+          PY
+          plugin/bin/vendor-wakeup --verify
+          cargo fmt --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo build --release --workspace --locked
+          if ! command -v shellcheck >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y shellcheck; fi
+          shellcheck --source-path=SCRIPTDIR -x plugin/bin/arm plugin/bin/build plugin/bin/disarm plugin/bin/doctor plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop plugin/bin/vendor-wakeup
+
+      - name: Read-only preflight
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          TESTED_SHA: ${{ steps.capture.outputs.tested_sha }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, subprocess, sys
+          owner, repo = os.environ['EXPECTED_REPOSITORY'].split('/')
+          tag_name = os.environ['RELEASE_TAG']
+          ref_name = f'refs/tags/{tag_name}'
+          query = '''query($owner:String!, $repo:String!, $tagName:String!, $refName:String!) {
+            tagRef: repository(owner:$owner, name:$repo) {
+              ref(qualifiedName:$refName) {
+                __typename
+                target {
+                  __typename
+                  ... on Tag {
+                    target {
+                      __typename
+                      ... on Commit { oid }
+                    }
+                  }
+                  ... on Commit { oid }
+                }
+              }
+            }
+            releaseRepo: repository(owner:$owner, name:$repo) {
+              release(tagName:$tagName) {
+                tagName
+                name
+                isDraft
+                isPrerelease
+                description
+                releaseAssets { totalCount }
+              }
+            }
+          }'''
+          proc = subprocess.run([
+            'gh', 'api', 'graphql',
+            '-f', f'query={query}',
+            '-F', f'owner={owner}',
+            '-F', f'repo={repo}',
+            '-F', f'tagName={tag_name}',
+            '-F', f'refName={ref_name}',
+          ], check=True, capture_output=True, text=True, env=os.environ)
+          data = json.loads(proc.stdout)
+          ref = data['data']['tagRef']['ref']
+          rel = data['data']['releaseRepo']['release']
+          notes = open(f'.github/release-notes/{tag_name}.md', encoding='utf-8').read()
+          publish_needed = None
+          if ref is None and rel is None:
+            publish_needed = True
+          elif ref is None and rel is not None:
+            raise SystemExit(1)
+          else:
+            if ref['target']['__typename'] != 'Tag':
+              raise SystemExit(1)
+            peeled = ref['target']['target']
+            if peeled is None or peeled['__typename'] != 'Commit' or peeled['oid'] != os.environ['TESTED_SHA']:
+              raise SystemExit(1)
+            if rel is None:
+              publish_needed = True
+            else:
+              if rel['tagName'] != tag_name or rel['name'] != tag_name:
+                raise SystemExit(1)
+              if rel['isDraft'] or rel['isPrerelease']:
+                raise SystemExit(1)
+              if rel['releaseAssets']['totalCount'] != 0:
+                raise SystemExit(1)
+              if rel.get('description', '') != notes:
+                raise SystemExit(1)
+              publish_needed = False
+          print(f'publish_needed={str(publish_needed).lower()}')
+          PY
+
+      - name: Smoke test
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, subprocess, sys
+          provenance = json.loads(pathlib.Path('plugin/vendor/provenance.json').read_text())
+          version = provenance['release_tag'].lstrip('v')
+          expected = f'wakeup {version}'
+          out = subprocess.run([
+              'plugin/vendor/linux-x86_64/wakeup',
+              '--version',
+          ], check=True, capture_output=True, text=True).stdout.strip()
+          if out != expected:
+              print(f'expected: {expected}')
+              print(f'actual:   {out}')
+              sys.exit(1)
+          PY
+
+  publish:
+    name: Publish release
+    needs: validate
+    if: needs.validate.outputs.publish_needed == 'true'
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - name: Guard repository and ref
+        run: |
+          test "${GITHUB_REPOSITORY}" = "${EXPECTED_REPOSITORY}"
+          test "${GITHUB_REF}" = "refs/heads/main"
+
+      - name: Checkout validated SHA
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.tested_sha }}
+          fetch-depth: 0
+
+      - name: Verify remote main unchanged
+        run: |
+          git fetch origin main --tags --force --prune --depth=1
+          test "$(git rev-parse origin/main)" = "${{ needs.validate.outputs.tested_sha }}"
+
+      - name: Mint repository token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: usrivastava92
+          repositories: herdr-wakeup
+          permission-contents: write
+
+      - name: Publish tag and release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          TESTED_SHA: ${{ needs.validate.outputs.tested_sha }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, pathlib, subprocess, sys
+          import re
+
+          tag = os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag):
+              sys.exit(1)
+          owner, repo = os.environ['EXPECTED_REPOSITORY'].split('/')
+          notes_path = pathlib.Path(f'.github/release-notes/{tag}.md')
+          notes = notes_path.read_text(encoding='utf-8')
+          ref_name = f'refs/tags/{tag}'
+          query = '''query($owner:String!, $repo:String!, $tagName:String!, $refName:String!) {
+            tagRef: repository(owner:$owner, name:$repo) {
+              ref(qualifiedName:$refName) {
+                __typename
+                target {
+                  __typename
+                  ... on Tag {
+                    target {
+                      __typename
+                      ... on Commit { oid }
+                    }
+                  }
+                  ... on Commit { oid }
+                }
+              }
+            }
+            releaseRepo: repository(owner:$owner, name:$repo) {
+              release(tagName:$tagName) {
+                tagName
+                name
+                isDraft
+                isPrerelease
+                description
+                releaseAssets { totalCount }
+              }
+            }
+          }'''
+
+          def gql():
+              proc = subprocess.run([
+                  'gh', 'api', 'graphql',
+                  '-f', f'query={query}',
+                  '-F', f'owner={owner}',
+                  '-F', f'repo={repo}',
+                  '-F', f'tagName={tag}',
+                  '-F', f'refName={ref_name}',
+              ], check=True, capture_output=True, text=True, env=os.environ)
+              return json.loads(proc.stdout)['data']
+
+          data = gql()
+          ref = data['tagRef']['ref']
+          rel = data['releaseRepo']['release']
+          extraheader = None
+          try:
+              data = gql()
+              ref = data['tagRef']['ref']
+              rel = data['releaseRepo']['release']
+              if ref is None and rel is None:
+                  annotated = False
+              elif ref is None and rel is not None:
+                  raise SystemExit(1)
+              else:
+                  if ref['target']['__typename'] != 'Tag':
+                      raise SystemExit(1)
+                  peeled = ref['target']['target']
+                  if peeled is None or peeled['__typename'] != 'Commit' or peeled['oid'] != os.environ['TESTED_SHA']:
+                      raise SystemExit(1)
+                  annotated = True
+                  if rel is None:
+                      pass
+                  else:
+                      if rel['tagName'] != tag or rel['name'] != tag or rel['isDraft'] or rel['isPrerelease'] or rel['releaseAssets']['totalCount'] != 0 or rel.get('description', '') != notes:
+                          raise SystemExit(1)
+
+              if not annotated:
+                  git_user_name = 'herdr-wakeup[bot]'
+                  git_user_email = 'herdr-wakeup[bot]@users.noreply.github.com'
+                  subprocess.run(['git', 'config', '--local', 'user.name', git_user_name], check=True)
+                  subprocess.run(['git', 'config', '--local', 'user.email', git_user_email], check=True)
+                  token = os.environ['GH_TOKEN']
+                  extra = base64.b64encode(f'x-access-token:{token}'.encode()).decode().replace('\n', '')
+                  subprocess.run(['git', 'config', '--local', 'http.https://github.com/.extraheader', f'AUTHORIZATION: basic {extra}'], check=True)
+                  extraheader = True
+                  subprocess.run(['git', 'tag', '-a', tag, '-m', f'herdr-wakeup {tag}', os.environ['TESTED_SHA']], check=True)
+                  subprocess.run(['git', 'push', 'origin', f'refs/tags/{tag}'], check=True, env=os.environ)
+                  subprocess.run(['gh', 'release', 'create', tag, '--verify-tag', '--title', tag, '--notes-file', str(notes_path)], check=True, env=os.environ)
+              elif rel is None:
+                  subprocess.run(['gh', 'release', 'create', tag, '--verify-tag', '--title', tag, '--notes-file', str(notes_path)], check=True, env=os.environ)
+              else:
+                  pass
+
+              data = gql()
+              ref = data['tagRef']['ref']
+              rel = data['releaseRepo']['release']
+              if ref is None or ref['target']['__typename'] != 'Tag':
+                  raise SystemExit(1)
+              peeled = ref['target']['target']
+              if peeled is None or peeled['__typename'] != 'Commit' or peeled['oid'] != os.environ['TESTED_SHA']:
+                  raise SystemExit(1)
+              if rel is None or rel['tagName'] != tag or rel['name'] != tag or rel['isDraft'] or rel['isPrerelease'] or rel['releaseAssets']['totalCount'] != 0 or rel.get('description', '') != notes:
+                  raise SystemExit(1)
+          finally:
+              if extraheader:
+                  subprocess.run(['git', 'config', '--local', '--unset-all', 'http.https://github.com/.extraheader'], check=False)
+              subprocess.run(['git', 'config', '--local', '--unset-all', 'user.name'], check=False)
+              subprocess.run(['git', 'config', '--local', '--unset-all', 'user.email'], check=False)
+          PY

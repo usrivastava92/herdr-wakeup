@@ -1,41 +1,56 @@
 name: Vendor wakeup binaries
 
-# Pulls the latest wakeup release binaries into plugin/vendor/ and commits
-# them, so `herdr plugin install`ing this repo brings a working `wakeup`
-# along without the end user needing a Rust toolchain. Runs weekly (to pick
-# up new wakeup releases) and on demand.
+# Manually refreshes vendored wakeup binaries and uploads the result as an
+# artifact for review. This workflow never commits or pushes to main.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "wakeup tag to vendor (blank = latest release)"
-        required: false
-  schedule:
-    - cron: "0 6 * * 1" # every Monday
+        description: "Pinned wakeup tag"
+        required: true
+
+concurrency:
+  group: herdr-wakeup-vendor-wakeup
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   vendor:
-    runs-on: ubuntu-latest
+    name: Vendor wakeup binaries
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Capture input
+        env:
+          WAKEUP_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', os.environ['WAKEUP_TAG']):
+              sys.exit(1)
+          PY
+          printf 'WAKEUP_TAG=%s\n' "$WAKEUP_TAG" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
 
       - name: Vendor wakeup binaries
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: plugin/bin/vendor-wakeup "${{ github.event.inputs.tag }}"
+          GH_TOKEN: ${{ github.token }}
+        run: plugin/bin/vendor-wakeup "$WAKEUP_TAG"
 
-      - name: Commit if changed
+      - name: Package vendor result
         run: |
-          if git diff --quiet -- plugin/vendor; then
-            echo "no vendor changes"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add plugin/vendor
-          git commit -m "chore: vendor latest wakeup binaries"
-          git push
+          tar -czf vendor-wakeup-result.tar.gz plugin/vendor
+
+      - name: Check artifact exists
+        run: test -s vendor-wakeup-result.tar.gz
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: vendor-wakeup-result
+          path: vendor-wakeup-result.tar.gz
+          retention-days: 7

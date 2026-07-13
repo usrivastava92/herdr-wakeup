@@ -9,15 +9,15 @@
 # relative to this repo, via resolve_bins() in plugin/bin/lib.sh - the same
 # way `herdr plugin install` builds it in place via bin/build.
 #
-# The standalone `wakeup` binary is a separate project and must be installed
-# separately, on PATH.
+# The standalone `wakeup` binary is vendored for supported macOS/Linux
+# platforms. No separate install is needed there.
 
 .PHONY: all build plugin-link plugin-unlink clean
 
 all: build
 
 build:
-	cargo build --release
+	cargo build --release --locked
 
 plugin-link: build
 	herdr plugin link "$(CURDIR)/plugin"
