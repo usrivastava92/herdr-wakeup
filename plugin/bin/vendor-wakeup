@@ -1,72 +1,266 @@
 #!/usr/bin/env bash
-# Downloads the latest (or a pinned) `wakeup` release from the wakeup repo
-# and lays the binaries out under plugin/vendor/<os>-<arch>/wakeup(.exe), so
-# that a plain `git clone` / `herdr plugin install` of this repo brings a
-# working `wakeup` binary along - no separate install step, no Rust
-# toolchain required by the end user for `wakeup` itself.
-#
-# Usage:
-#   plugin/bin/vendor-wakeup                # latest release
-#   plugin/bin/vendor-wakeup v0.2.0          # a specific tag
-#   WAKEUP_REPO=someorg/wakeup plugin/bin/vendor-wakeup
-#
-# Requires the `gh` CLI, authenticated against GitHub.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" # plugin/bin
-REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-VENDOR_DIR="$REPO_ROOT/plugin/vendor"
+EXPECTED_REPO="usrivastava92/wakeup"
+TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+DEFAULT_VENDOR_DIR="$REPO_ROOT/plugin/vendor"
+LIVE_VENDOR_DIR="${VENDOR_DIR:-$DEFAULT_VENDOR_DIR}"
+PROVENANCE_FILE="$LIVE_VENDOR_DIR/provenance.json"
+LOCK_FILE="$REPO_ROOT/.vendor-wakeup.lock"
 
-# TODO: update once the wakeup repo has a real GitHub remote.
-WAKEUP_REPO="${WAKEUP_REPO:-<owner>/wakeup}"
+usage() { echo "usage: plugin/bin/vendor-wakeup vX.Y.Z | --verify" >&2; exit 1; }
+die() { echo "vendor-wakeup: $*" >&2; exit 1; }
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+
 TAG="${1:-}"
+[ -n "$TAG" ] || usage
+VERIFY_ONLY=0
+[ "$TAG" = "--verify" ] && VERIFY_ONLY=1
 
-if ! command -v gh >/dev/null 2>&1; then
-  echo "vendor-wakeup: the 'gh' CLI is required (https://cli.github.com/)" >&2
-  exit 1
-fi
-
-# release-asset-name -> plugin/vendor/<dir>/<binary-name>
-declare -A ASSET_MAP=(
-  ["wakeup-macos-arm64"]="macos-arm64/wakeup"
-  ["wakeup-macos-x86_64"]="macos-x86_64/wakeup"
-  ["wakeup-linux-x86_64"]="linux-x86_64/wakeup"
-  ["wakeup-linux-arm64"]="linux-arm64/wakeup"
-  ["wakeup-windows-x86_64.exe"]="windows-x86_64/wakeup.exe"
-)
-
-tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
-
-dl_args=(release download --repo "$WAKEUP_REPO" --dir "$tmp_dir" --clobber)
-if [ -n "$TAG" ]; then
-  dl_args+=("$TAG")
-else
-  dl_args+=(--pattern "wakeup-*")
-fi
-
-echo "vendor-wakeup: downloading from $WAKEUP_REPO${TAG:+ @ $TAG} ..."
-gh "${dl_args[@]}"
-
-updated=0
-for asset in "${!ASSET_MAP[@]}"; do
-  src="$tmp_dir/$asset"
-  dest_rel="${ASSET_MAP[$asset]}"
-  dest="$VENDOR_DIR/$dest_rel"
-  if [ ! -f "$src" ]; then
-    echo "vendor-wakeup: warning: $asset not found in release, skipping ($dest_rel stays as-is)" >&2
-    continue
+if [ "$VERIFY_ONLY" -eq 0 ]; then
+  if [ "${VENDOR_DIR:-}" != "" ] && [ "$LIVE_VENDOR_DIR" != "$DEFAULT_VENDOR_DIR" ]; then
+    die "VENDOR_DIR override is only supported with --verify"
   fi
-  mkdir -p "$(dirname "$dest")"
-  cp "$src" "$dest"
-  chmod +x "$dest"
-  echo "vendor-wakeup: updated $dest_rel"
-  updated=$((updated + 1))
-done
-
-if [ "$updated" -eq 0 ]; then
-  echo "vendor-wakeup: no assets were updated - check WAKEUP_REPO/tag and the release's asset names" >&2
-  exit 1
+  command -v gh >/dev/null 2>&1 || die "gh is required for vendoring"
+  python3 - "$TAG" "$TAG_RE" <<'PY' || usage
+import re, sys
+if not re.fullmatch(sys.argv[2], sys.argv[1]):
+    raise SystemExit(1)
+PY
 fi
 
-echo "vendor-wakeup: done ($updated binaries updated)"
+read -r -d '' ASSET_SPECS <<'EOF' || true
+wakeup-macos-arm64|macos-arm64/wakeup|mach-o|arm64|755
+wakeup-macos-x86_64|macos-x86_64/wakeup|mach-o|x86_64|755
+wakeup-linux-x86_64|linux-x86_64/wakeup|elf|x86_64|755
+wakeup-linux-arm64|linux-arm64/wakeup|elf|aarch64|755
+wakeup-windows-x86_64.exe|windows-x86_64/wakeup.exe|pe|x86_64|644
+EOF
+
+verify_tree() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import hashlib, json, os, re, stat, sys
+prov_path, vendor_dir, tag_re, asset_specs = sys.argv[1:5]
+specs = [l for l in asset_specs.splitlines() if l.strip()]
+expected = {}
+for spec in specs:
+    name, dest, kind, arch, mode = spec.split('|')
+    expected[name] = {'destination': dest, 'type': kind, 'arch': arch, 'mode': int(mode, 8)}
+
+def fail(msg): raise SystemExit(msg)
+
+prov = json.load(open(prov_path, 'r', encoding='utf-8'))
+if prov.get('release_repo') != 'usrivastava92/wakeup': fail('release_repo mismatch')
+if not isinstance(prov.get('release_id'), int) or prov['release_id'] <= 0: fail('release_id must be positive')
+if not isinstance(prov.get('release_tag'), str) or not re.fullmatch(tag_re, prov['release_tag']): fail('release_tag must be anchored semver')
+if not isinstance(prov.get('tag_commit_sha'), str) or not re.fullmatch(r'[0-9a-f]{40}', prov['tag_commit_sha']): fail('tag_commit_sha must be 40 lowercase hex chars')
+assets = prov.get('assets')
+if not isinstance(assets, list) or len(assets) != 5: fail('provenance must contain exactly five assets')
+seen_ids, seen_names, actual = set(), set(), set()
+for a in assets:
+    for k in ('id','name','destination','type','arch','size','api_digest'):
+        if k not in a: fail('asset missing ' + k)
+    if not isinstance(a['id'], int) or a['id'] <= 0 or a['id'] in seen_ids: fail('asset id invalid')
+    seen_ids.add(a['id'])
+    if a['name'] in seen_names or a['name'] not in expected: fail('asset name invalid')
+    seen_names.add(a['name'])
+    spec = expected[a['name']]
+    if a['destination'] != spec['destination'] or a['type'] != spec['type'] or a['arch'] != spec['arch']: fail('asset schema mismatch for ' + a['name'])
+    if not isinstance(a['size'], int) or a['size'] <= 0: fail('asset size invalid')
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', a['api_digest']): fail('asset digest invalid')
+    p = os.path.join(vendor_dir, a['destination'])
+    if not os.path.realpath(p).startswith(os.path.realpath(vendor_dir) + os.sep): fail('asset path escapes vendor dir')
+    if os.path.islink(p) or not os.path.isfile(p): fail('asset must be a regular file: ' + a['destination'])
+    st = os.stat(p)
+    if stat.S_IMODE(st.st_mode) != spec['mode']: fail('asset mode mismatch for ' + a['destination'])
+    data = open(p,'rb').read()
+    if len(data) != a['size'] or 'sha256:' + hashlib.sha256(data).hexdigest() != a['api_digest']: fail('asset hash/size mismatch for ' + a['destination'])
+    if a['type'] == 'mach-o':
+        if not data.startswith(b'\xcf\xfa\xed\xfe'): fail('mach-o magic mismatch for ' + a['destination'])
+        cpu = int.from_bytes(data[4:8], 'little', signed=True)
+        if a['arch'] == 'arm64' and cpu != 0x0100000c: fail('mach-o cpu mismatch for ' + a['destination'])
+        if a['arch'] == 'x86_64' and cpu != 0x01000007: fail('mach-o cpu mismatch for ' + a['destination'])
+    elif a['type'] == 'elf':
+        if not data.startswith(b'\x7fELF') or data[4] != 2: fail('elf magic/class mismatch for ' + a['destination'])
+        machine = int.from_bytes(data[18:20], 'little')
+        if a['arch'] == 'x86_64' and machine != 62: fail('elf machine mismatch for ' + a['destination'])
+        if a['arch'] == 'aarch64' and machine != 183: fail('elf machine mismatch for ' + a['destination'])
+    elif a['type'] == 'pe':
+        if not data.startswith(b'MZ'): fail('pe mz mismatch for ' + a['destination'])
+        off = int.from_bytes(data[60:64], 'little')
+        if data[off:off+4] != b'PE\x00\x00' or int.from_bytes(data[off+4:off+6], 'little') != 0x8664: fail('pe machine mismatch for ' + a['destination'])
+    actual.add(a['destination'])
+
+if seen_ids != set(x['id'] for x in assets) or seen_names != set(expected): fail('asset uniqueness mismatch')
+expected_entries = set(['provenance.json'] + [x['destination'] for x in assets])
+actual_entries = set()
+for root, dirs, files in os.walk(vendor_dir):
+    dirs.sort(); files.sort()
+    for n in dirs + files:
+        full = os.path.join(root, n)
+        if os.path.islink(full): fail('vendor tree must not contain symlinks: ' + os.path.relpath(full, vendor_dir))
+    for n in files:
+        actual_entries.add(os.path.relpath(os.path.join(root, n), vendor_dir))
+if actual_entries != expected_entries: fail('vendor tree has extra or missing entries')
+PY
+}
+
+stage_vendor_release() {
+  tmp_root="$1"
+  stage_vendor="$2"
+  requested_tag="$3"
+  release_json="$tmp_root/release.json"
+  ref_json="$tmp_root/ref.json"
+  tag_obj_json="$tmp_root/tag-object.json"
+  mkdir -p "$stage_vendor"
+  gh api "repos/$EXPECTED_REPO/releases/tags/$requested_tag" > "$release_json"
+  resolve_tag_commit_sha() {
+    local current_ref_json="$ref_json"
+    local current_tag_json="$tag_obj_json"
+    local depth kind sha
+    depth=0
+    gh api "repos/$EXPECTED_REPO/git/ref/tags/$requested_tag" > "$current_ref_json"
+    while :; do
+      kind="$(python3 - "$current_ref_json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))['object']['type'])
+PY
+)"
+      sha="$(python3 - "$current_ref_json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))['object']['sha'])
+PY
+)"
+      case "$kind" in
+        commit)
+          printf '%s' "$sha"
+          return 0
+          ;;
+        tag)
+          depth=$((depth + 1))
+          [ "$depth" -le 10 ] || die "tag reference recursion exceeded limit"
+          gh api "repos/$EXPECTED_REPO/git/tags/$sha" > "$current_tag_json"
+          current_ref_json="$current_tag_json"
+          ;;
+        *)
+          die "unsupported tag ref object type: $kind"
+          ;;
+      esac
+    done
+  }
+  tag_commit_sha="$(resolve_tag_commit_sha)"
+  python3 - "$release_json" "$tag_commit_sha" "$requested_tag" "$stage_vendor" "$ASSET_SPECS" <<'PY'
+import hashlib, json, os, re, subprocess, sys, tempfile
+release = json.load(open(sys.argv[1]))
+tag_commit_sha, requested_tag, stage_vendor, asset_specs = sys.argv[2:6]
+specs = [l for l in asset_specs.splitlines() if l.strip()]
+def fail(msg): raise SystemExit(msg)
+if release.get('tag_name') != requested_tag or release.get('draft') or release.get('prerelease'): fail('release must be published exact tag')
+if not isinstance(release.get('id'), int) or release['id'] <= 0: fail('release id invalid')
+if not re.fullmatch(r'[0-9a-f]{40}', tag_commit_sha): fail('resolved commit sha invalid')
+assets = release.get('assets')
+if not isinstance(assets, list) or len(assets) != 5: fail('release must contain exactly five assets')
+by_name = {}
+for a in assets:
+    if a.get('name') in by_name: fail('duplicate release asset name')
+    by_name[a.get('name')] = a
+    if a.get('state') != 'uploaded' or not isinstance(a.get('id'), int) or a['id'] <= 0 or not isinstance(a.get('size'), int) or a['size'] <= 0 or not re.fullmatch(r'sha256:[0-9a-f]{64}', a.get('digest','')):
+        fail('asset schema invalid: ' + str(a.get('name')))
+with tempfile.TemporaryDirectory(dir=stage_vendor) as td:
+    prov = {'release_repo':'usrivastava92/wakeup','release_id':release['id'],'release_tag':requested_tag,'tag_commit_sha':tag_commit_sha,'assets':[]}
+    for spec in specs:
+        name, dest, kind, arch, mode = spec.split('|')
+        a = by_name.get(name)
+        if a is None: fail('missing asset ' + name)
+        out = os.path.join(stage_vendor, dest)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        tmp = os.path.join(td, name)
+        with open(tmp,'wb') as fh:
+            subprocess.run(['gh','api','--method','GET','-H','Accept: application/octet-stream','repos/usrivastava92/wakeup/releases/assets/%s' % a['id']], check=True, stdout=fh)
+        data = open(tmp,'rb').read()
+        if len(data) != a['size'] or 'sha256:' + hashlib.sha256(data).hexdigest() != a['digest']: fail('download verification failed for ' + name)
+        with open(out,'wb') as fh: fh.write(data)
+        os.chmod(out, int(mode, 8))
+        prov['assets'].append({'id':a['id'],'name':name,'destination':dest,'type':kind,'arch':arch,'size':a['size'],'api_digest':a['digest']})
+    prov['assets'].sort(key=lambda x: x['name'])
+    out = os.path.join(stage_vendor, 'provenance.json')
+    with open(out,'w',encoding='utf-8') as fh:
+        json.dump(prov, fh, indent=2, sort_keys=True); fh.write('\n')
+    os.chmod(out, 0o644)
+PY
+}
+
+acquire_lock() {
+  lock_dir="${LOCK_FILE}.d"
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_FILE"
+    return 0
+  fi
+  die "another vendor-wakeup invocation is already running"
+}
+
+release_lock() {
+  if [ -d "${LOCK_FILE}.d" ] && [ "$(cat "$LOCK_FILE" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$LOCK_FILE"
+    rmdir "${LOCK_FILE}.d" 2>/dev/null || true
+  fi
+}
+
+cleanup_run() {
+  if [ -n "${BACKUP_VENDOR:-}" ] && [ -e "$BACKUP_VENDOR" ]; then
+    rollback_run
+  fi
+  if [ -n "${TMP_ROOT:-}" ] && [ -d "$TMP_ROOT" ]; then rm -rf "$TMP_ROOT"; fi
+  release_lock
+}
+
+rollback_run() {
+  if [ -n "${STAGE_VENDOR:-}" ] && [ -d "$STAGE_VENDOR" ]; then rm -rf "$STAGE_VENDOR"; fi
+  if [ -n "${BACKUP_VENDOR:-}" ] && [ -d "$BACKUP_VENDOR" ]; then
+    if [ -e "$DEFAULT_VENDOR_DIR" ]; then rm -rf "$DEFAULT_VENDOR_DIR"; fi
+    mv "$BACKUP_VENDOR" "$DEFAULT_VENDOR_DIR"
+  fi
+}
+
+trap cleanup_run EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+if [ "$VERIFY_ONLY" -eq 1 ]; then
+  verify_tree "$PROVENANCE_FILE" "$LIVE_VENDOR_DIR" "$TAG_RE" "$ASSET_SPECS"
+  echo "vendor-wakeup: offline verification passed"
+  exit 0
+fi
+
+acquire_lock
+TMP_ROOT="$(mktemp -d "$REPO_ROOT/vendor-wakeup.XXXXXXXX")"
+STAGE_VENDOR="$TMP_ROOT/stage/vendor"
+BACKUP_VENDOR="$TMP_ROOT/backup/vendor"
+FAIL_AFTER_INSTALL="${VENDOR_WAKEUP_FAIL_AFTER_INSTALL:-0}"
+FAIL_POINT="${VENDOR_WAKEUP_FAIL_POINT:-}"
+mkdir -p "$STAGE_VENDOR" "$(dirname "$BACKUP_VENDOR")"
+
+stage_vendor_release "$TMP_ROOT" "$STAGE_VENDOR" "$TAG"
+verify_tree "$STAGE_VENDOR/provenance.json" "$STAGE_VENDOR" "$TAG_RE" "$ASSET_SPECS"
+
+mv "$DEFAULT_VENDOR_DIR" "$BACKUP_VENDOR"
+if [ "$FAIL_POINT" = "after-live-backup" ]; then
+  die "final verification failed"
+fi
+mv "$STAGE_VENDOR" "$DEFAULT_VENDOR_DIR"
+if [ "$FAIL_POINT" = "after-stage-install" ]; then
+  die "final verification failed"
+fi
+if [ "$FAIL_AFTER_INSTALL" = "1" ]; then
+  echo "vendor-wakeup: test hook forcing final verification failure" >&2
+  die "final verification failed"
+fi
+if ! verify_tree "$PROVENANCE_FILE" "$LIVE_VENDOR_DIR" "$TAG_RE" "$ASSET_SPECS"; then
+  die "final verification failed"
+fi
+rm -rf "$BACKUP_VENDOR"
+echo "vendor-wakeup: vendored $TAG"

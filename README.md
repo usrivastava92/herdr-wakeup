@@ -1,9 +1,9 @@
 # herdr-wakeup
 
-A Herdr plugin that keeps macOS awake while Herdr-managed agents are working.
+A Herdr plugin that keeps macOS and Linux awake while Herdr-managed agents are working.
 
 This repo contains the Herdr-specific watcher and plugin wrapper.
-The standalone power assertion utility lives in the separate `wakeup` repo and must be installed separately.
+The standalone power assertion utility is vendored for supported macOS and Linux platforms.
 
 `wakeup-herdr` (this repo's watcher binary) is an **internal implementation detail of the plugin**, not a user-facing CLI.
 It is never installed to `PATH`: it is built in place inside this repo (`target/release/wakeup-herdr`) and the plugin's own action scripts find it there.
@@ -12,7 +12,7 @@ The supported, user-facing interface is entirely `herdr plugin action invoke ...
 ## What it does
 
 `herdr-wakeup` watches Herdr agent state.
-When at least one agent is `working`, it runs `wakeup` to hold a macOS power assertion.
+When at least one agent is `working`, it runs `wakeup` to hold a power assertion.
 When agents stop working, it releases the assertion after a short grace period.
 
 The watcher is event-driven.
@@ -21,19 +21,21 @@ No `herdr` process is spawned during normal operation; a CLI shellout only happe
 
 ## Requirements
 
-- macOS.
+- macOS or Linux.
 - Herdr `>= 0.7.0`.
 - Rust toolchain, to build this repo's own small watcher binary (`wakeup-herdr`) from source.
-- **No separate `wakeup` install and no cargo build for it**: a prebuilt `wakeup` binary for your platform is vendored inside this repo (see below). It is only necessary to have `wakeup` on `PATH` yourself if your platform/arch isn't one of the vendored combos yet.
+- **No separate `wakeup` install and no cargo build for it**: a prebuilt `wakeup` binary for your platform is vendored inside this repo (see below). Supported macOS and Linux combinations use the vendored binary.
 
 ## Vendored `wakeup` binary
 
-`plugin/vendor/<os>-<arch>/wakeup` in this repo holds a prebuilt copy of the standalone `wakeup` CLI (separate repo) for each supported platform, refreshed automatically by [`.github/workflows/vendor-wakeup.yml`](.github/workflows/vendor-wakeup.yml) whenever `wakeup` cuts a new release, and committed straight into git (these binaries are tiny - `wakeup` has zero external dependencies).
+`plugin/vendor/<os>-<arch>/wakeup` in this repo holds a prebuilt copy of the standalone `wakeup` CLI (separate repo) for each supported platform.
+The vendored set is refreshed by [`plugin/bin/vendor-wakeup`](plugin/bin/vendor-wakeup) and reviewed through [`.github/workflows/vendor-wakeup.yml`](.github/workflows/vendor-wakeup.yml).
 `resolve_bins` in `plugin/bin/lib.sh` picks the file matching `uname -s`/`uname -m` automatically and makes it executable; it only falls back to a `wakeup` on `PATH` if no vendored binary matches your platform/arch.
-This means cloning or `herdr plugin install`-ing this repo is enough - there's no separate `wakeup` install step, and no cargo/Rust needed for `wakeup` itself (only for this repo's own `wakeup-herdr` watcher, which is a tiny, dependency-free crate).
+This means cloning or `herdr plugin install`-ing this repo is enough - there's no separate `wakeup` install step, and no cargo/Rust needed for `wakeup` itself (only for this repo's own `wakeup-herdr` watcher, which uses `serde_json`).
 
-Currently vendored: `macos-arm64`, `linux-x86_64`, `linux-arm64`, `windows-x86_64` (Linux binaries are static `musl` builds, so they run on any distro regardless of glibc version).
-To refresh manually: `WAKEUP_REPO=<owner>/wakeup plugin/bin/vendor-wakeup [tag]` (defaults to the latest release).
+Currently vendored: `macos-arm64`, `macos-x86_64`, `linux-x86_64`, `linux-arm64`, `windows-x86_64`.
+Linux binaries are static `musl` builds, so they run on any distro regardless of glibc version.
+To refresh manually from the committed upstream `v0.1.3` set: `plugin/bin/vendor-wakeup v0.1.3`.
 
 ## Build and link locally
 
@@ -42,6 +44,20 @@ make plugin-link   # builds target/release/wakeup-herdr, then `herdr plugin link
 ```
 
 (`herdr plugin install <repo-url>`, the non-local/from-GitHub path, builds the same binary automatically via the plugin's own `bin/build` hook - no separate install step needed either way.)
+
+Install from GitHub with a pinned tag:
+
+```bash
+herdr plugin install usrivastava92/herdr-wakeup/plugin --ref v0.1.0
+```
+
+This uses the `/plugin` install path and a pinned tag for deterministic provenance.
+
+`plugin/vendor/provenance.json` records the vendored artifact provenance for the committed upstream `v0.1.3` set and its API digests.
+
+Use `plugin/bin/vendor-wakeup --verify` for offline verification of the shipped artifacts.
+
+Windows support is mirrored for future parity only.
 
 Then use the plugin actions - this is the supported, user-facing interface:
 

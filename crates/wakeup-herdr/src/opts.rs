@@ -1,4 +1,4 @@
-//! CLI + environment parsing for wakeup-herdr.
+//! CLI + environment parsing for wakeup-herdr on macOS and Linux.
 
 use crate::persist;
 use std::time::Duration;
@@ -29,7 +29,7 @@ pub struct Opts {
 }
 
 const USAGE: &str = "\
-wakeup-herdr - keep macOS awake while a Herdr agent is working (event-driven)
+wakeup-herdr - keep macOS and Linux awake while a Herdr agent is working (event-driven)
 
 USAGE:
     wakeup-herdr [options]
