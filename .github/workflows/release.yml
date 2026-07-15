@@ -80,10 +80,11 @@ jobs:
           plugin/bin/vendor-wakeup --verify
           cargo fmt --check
           cargo test --workspace --locked
+          bash tests/start-race.sh
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo build --release --workspace --locked
           if ! command -v shellcheck >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y shellcheck; fi
-          shellcheck --source-path=SCRIPTDIR -x plugin/bin/arm plugin/bin/build plugin/bin/disarm plugin/bin/doctor plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop plugin/bin/vendor-wakeup
+          shellcheck --source-path=SCRIPTDIR -x plugin/bin/arm plugin/bin/build plugin/bin/disarm plugin/bin/doctor plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop plugin/bin/vendor-wakeup tests/start-race.sh
 
       - name: Read-only preflight
         id: preflight
