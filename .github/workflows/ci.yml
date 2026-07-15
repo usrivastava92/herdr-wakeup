@@ -32,11 +32,14 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Concurrent start regression
+        run: bash tests/start-race.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Shellcheck
-        run: shellcheck --source-path=SCRIPTDIR -x plugin/bin/arm plugin/bin/build plugin/bin/disarm plugin/bin/doctor plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop plugin/bin/vendor-wakeup
+        run: shellcheck --source-path=SCRIPTDIR -x plugin/bin/arm plugin/bin/build plugin/bin/disarm plugin/bin/doctor plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop plugin/bin/vendor-wakeup tests/start-race.sh
 
       - name: Offline vendor verify
         run: plugin/bin/vendor-wakeup --verify
@@ -94,11 +97,14 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Concurrent start regression
+        run: bash tests/start-race.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Shellcheck
-        run: shellcheck --source-path=SCRIPTDIR -x plugin/bin/arm plugin/bin/build plugin/bin/disarm plugin/bin/doctor plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop plugin/bin/vendor-wakeup
+        run: shellcheck --source-path=SCRIPTDIR -x plugin/bin/arm plugin/bin/build plugin/bin/disarm plugin/bin/doctor plugin/bin/lib.sh plugin/bin/start plugin/bin/status plugin/bin/stop plugin/bin/vendor-wakeup tests/start-race.sh
 
       - name: Offline vendor verify
         run: plugin/bin/vendor-wakeup --verify

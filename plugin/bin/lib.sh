@@ -107,6 +107,140 @@ session_key() {
 
 pidfile() { printf '%s/watcher.pid' "$(state_dir)"; }
 logfile() { printf '%s/watcher.log' "$(state_dir)"; }
+lockdir() { printf '%s/watcher.start.lock' "$(state_dir)"; }
+reclaimdir() { printf '%s/watcher.start.reclaim.lock' "$(state_dir)"; }
+lock_grace_seconds() { printf '%s' "${HERDR_WAKEUP_START_LOCK_GRACE_SECONDS:-2}"; }
+
+_lock_dir_owned_by_self() {
+  local d pidfile pid
+  d="$1"
+  pidfile="$d/pid"
+  [ -d "$d" ] || return 1
+  [ -f "$pidfile" ] || return 1
+  IFS= read -r pid < "$pidfile" 2>/dev/null || return 1
+  [ "$pid" = "$$" ]
+}
+
+_cleanup_lockdir_if_owned() {
+  local d
+  d="$1"
+  if _lock_dir_owned_by_self "$d"; then
+    rm -rf "$d" 2>/dev/null || true
+  fi
+}
+
+release_start_locks() {
+  _cleanup_lockdir_if_owned "$(lockdir)"
+  _cleanup_lockdir_if_owned "$(reclaimdir)"
+}
+
+_lock_mtime() {
+  case "$(uname -s)" in
+    Darwin) stat -f %m "$1" 2>/dev/null || return 1 ;;
+    Linux) stat -c %Y "$1" 2>/dev/null || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+_lock_age_at_least_grace() {
+  local d now mtime grace age
+  d="$(lockdir)"
+  grace="$(lock_grace_seconds)"
+  mtime="$(_lock_mtime "$d" 2>/dev/null || true)"
+  now="$(date +%s 2>/dev/null || printf 0)"
+  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  case "$grace" in ''|*[!0-9]*) return 1 ;; esac
+  age=$((now - mtime))
+  [ "$age" -ge "$grace" ]
+}
+
+_mutex_is_stale() {
+  local d pidfile pid mtime now grace age
+  d="$1"
+  pidfile="$d/pid"
+  grace="$(lock_grace_seconds)"
+  [ -d "$d" ] || return 1
+  mtime="$(_lock_mtime "$d" 2>/dev/null || true)"
+  now="$(date +%s 2>/dev/null || printf 0)"
+  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  case "$grace" in ''|*[!0-9]*) return 1 ;; esac
+  if [ ! -f "$pidfile" ]; then
+    age=$((now - mtime))
+    [ "$age" -ge "$grace" ]
+    return $?
+  fi
+  IFS= read -r pid < "$pidfile" 2>/dev/null || {
+    age=$((now - mtime))
+    [ "$age" -ge "$grace" ]
+    return $?
+  }
+  case "$pid" in
+    ''|*[!0-9]*) age=$((now - mtime)); [ "$age" -ge "$grace" ]; return $? ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 0
+  return 1
+}
+
+acquire_reclaim_mutex() {
+  local d
+  d="$(reclaimdir)"
+  while :; do
+    if mkdir "$d" 2>/dev/null; then
+      printf '%s\n' "$$" > "$d/pid"
+      trap 'release_start_locks' EXIT INT TERM HUP
+      return 0
+    fi
+    if _mutex_is_stale "$d"; then
+      rm -rf "$d" 2>/dev/null || true
+      continue
+    fi
+    sleep 0.05
+  done
+}
+
+lock_is_stale() {
+  local d f pid
+  d="$(lockdir)"
+  f="$(lockdir)/pid"
+  [ -d "$d" ] || return 1
+  if [ ! -f "$f" ]; then
+    _lock_age_at_least_grace
+    return $?
+  fi
+  IFS= read -r pid < "$f" 2>/dev/null || {
+    _lock_age_at_least_grace
+    return $?
+  }
+  case "$pid" in
+    ''|*[!0-9]*) _lock_age_at_least_grace; return $? ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 0
+  return 1
+}
+
+acquire_start_lock() {
+  local mode="${1:-wait}" d
+  d="$(lockdir)"
+  while :; do
+    if mkdir "$d" 2>/dev/null; then
+      printf '%s\n' "$$" > "$d/pid"
+      trap 'release_start_locks' EXIT INT TERM HUP
+      return 0
+    fi
+    if lock_is_stale; then
+      acquire_reclaim_mutex
+      if lock_is_stale; then
+        rm -rf "$d" 2>/dev/null || true
+      fi
+      _cleanup_lockdir_if_owned "$(reclaimdir)"
+      continue
+    fi
+    [ "$mode" = try ] && return 1
+    sleep 0.05
+  done
+}
 
 write_pidfile() {
   local pid="$1" bin="$2" f

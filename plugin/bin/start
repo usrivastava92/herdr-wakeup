@@ -25,12 +25,21 @@ if [ "$auto" = 1 ]; then
   # Never let an event handler fail the caller: a missing binary or disabled
   # autostart is just "nothing to do", not an error.
   resolve_bins || exit 0
+else
+  resolve_bins
+fi
+
+if [ "$auto" = 1 ]; then
   # Fast path: already running -> done. Keeps repeated events near-free.
   watcher_pid >/dev/null 2>&1 && exit 0
   # Gate: only autostart when the config/env decision says so.
   "$WAKEUP_HERDR" autostart-decision >/dev/null 2>&1 || exit 0
+  acquire_start_lock try || exit 0
+  if pid="$(watcher_pid)"; then
+    exit 0
+  fi
 else
-  resolve_bins
+  acquire_start_lock wait
   if pid="$(watcher_pid)"; then
     echo "herdr-wakeup watcher already running (pid $pid)"
     exit 0
