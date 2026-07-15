@@ -55,3 +55,23 @@ id = "doctor"
 title = "Wakeup: doctor"
 contexts = ["global", "workspace", "pane"]
 command = ["bash", "bin/doctor"]
+
+# Autostart trigger. Herdr has no dedicated session-start hook, but it does run
+# plugin event commands on pane/tab lifecycle changes - and it runs them itself,
+# so they fire even when no watcher of ours is running yet. That is what makes
+# autostart work with zero shell-rc edits or login agents: whenever Herdr is
+# active and panes come and go, `start --auto` ensures a watcher is up (a cheap
+# no-op if one already is). `pane.focused` fires often enough to also restart a
+# watcher that died mid-session, so a stale/absent watcher self-heals on the
+# next interaction rather than silently staying down.
+[[events]]
+on = "pane.created"
+command = ["bash", "bin/start", "--auto"]
+
+[[events]]
+on = "tab.created"
+command = ["bash", "bin/start", "--auto"]
+
+[[events]]
+on = "pane.focused"
+command = ["bash", "bin/start", "--auto"]

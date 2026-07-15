@@ -73,6 +73,7 @@ fn main() {
         Some("state") => return print_state(),
         Some("paths") => return print_paths(),
         Some("doctor") => return run_doctor(),
+        Some("autostart-decision") => return print_autostart_decision(),
         _ => {}
     }
 
@@ -116,6 +117,24 @@ fn set_armed(armed: bool) {
             eprintln!("wakeup-herdr: failed to save {}: {e}", path.display());
             std::process::exit(1);
         }
+    }
+}
+
+/// `wakeup-herdr autostart-decision`: resolve whether autostart should run for
+/// this session and signal it via exit status so `bin/start --auto` can gate on
+/// it directly (`wakeup-herdr autostart-decision >/dev/null || exit 0`). Prints
+/// `enabled`/`disabled` for humans and exits 0 when enabled, 1 when disabled.
+/// Reads config.json but never creates it - a missing file is just the default
+/// (enabled), so the event-driven autostart works before any config exists. Env
+/// precedence over the config flag is handled in
+/// [`persist::Config::autostart_enabled`].
+fn print_autostart_decision() {
+    let (cfg, _) = persist::Config::load(&persist::config_path());
+    if cfg.autostart_enabled() {
+        println!("enabled");
+    } else {
+        println!("disabled");
+        std::process::exit(1);
     }
 }
 
@@ -208,6 +227,23 @@ fn run_doctor() {
     println!("  statuses:            {}", cfg.statuses.join(", "));
     println!("  notify:              {}", cfg.notify);
     println!("  allow_cli_fallback:  {}", cfg.allow_cli_fallback);
+    // Show the stored flag, the effective decision, and - when the env var is
+    // actively overriding the flag - call that out so a surprising decision is
+    // traceable to its real source rather than looking like the config lied.
+    let env_override = std::env::var("HERDR_WAKEUP_AUTOSTART")
+        .ok()
+        .and_then(|v| persist::parse_bool(&v));
+    let effective = cfg.autostart_enabled();
+    let source = match env_override {
+        Some(_) => " via $HERDR_WAKEUP_AUTOSTART",
+        None => "",
+    };
+    println!(
+        "  autostart:           {} (effective: {}{})",
+        cfg.autostart,
+        if effective { "enabled" } else { "disabled" },
+        source
+    );
     let resolved_wakeup = opts::resolve_wakeup_bin(&cfg);
     let resolved_herdr = opts::resolve_herdr_bin(&cfg);
     println!(

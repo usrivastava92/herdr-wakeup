@@ -124,6 +124,27 @@ pub struct Config {
     /// [`Config::effective_herdr_bin`].
     pub herdr_bin: Option<String>,
     pub allow_cli_fallback: bool,
+    /// Whether the plugin's Herdr event hooks may launch a watcher for this
+    /// session. Herdr has no dedicated session-start lifecycle hook, so the
+    /// plugin instead registers `pane.created`/`tab.created`/`pane.focused`
+    /// event commands (see herdr-plugin.toml) that run `start --auto`; this
+    /// flag is the persistent on/off *policy* that `start --auto` consults, and
+    /// the `HERDR_WAKEUP_AUTOSTART` env var overrides it per-shell (see
+    /// [`Config::autostart_enabled`]). Defaults to `true` so a freshly
+    /// installed plugin keeps a watcher running without an opt-in step - the
+    /// whole point is to avoid a silently-absent watcher.
+    pub autostart: bool,
+}
+
+/// Parse a human/env boolean the way the autostart env override accepts it.
+/// Returns `None` for anything unrecognized, so an unparseable env value
+/// falls through to the config flag rather than silently disabling.
+pub fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 impl Default for Config {
@@ -138,6 +159,7 @@ impl Default for Config {
             wakeup_bin: None,
             herdr_bin: None,
             allow_cli_fallback: false,
+            autostart: true,
         }
     }
 }
@@ -240,7 +262,24 @@ impl Config {
                 .get("allow_cli_fallback")
                 .and_then(Value::as_bool)
                 .unwrap_or(d.allow_cli_fallback),
+            autostart: v
+                .get("autostart")
+                .and_then(Value::as_bool)
+                .unwrap_or(d.autostart),
         }
+    }
+
+    /// Resolve whether autostart is enabled, applying env precedence over the
+    /// persisted `autostart` flag: `HERDR_WAKEUP_AUTOSTART` wins when it holds
+    /// a recognized boolean (see [`parse_bool`]); otherwise the config flag
+    /// decides. This is what the `autostart` action consults at session start.
+    pub fn autostart_enabled(&self) -> bool {
+        if let Ok(v) = std::env::var("HERDR_WAKEUP_AUTOSTART") {
+            if let Some(b) = parse_bool(&v) {
+                return b;
+            }
+        }
+        self.autostart
     }
 
     /// The resolved `wakeup` binary: the config override if one was set,
@@ -291,6 +330,7 @@ impl Config {
             "allow_cli_fallback".to_string(),
             serde_json::json!(self.allow_cli_fallback),
         );
+        map.insert("autostart".to_string(), serde_json::json!(self.autostart));
         Value::Object(map)
     }
 
@@ -626,6 +666,87 @@ mod tests {
         assert!(err.is_none());
         assert_eq!(loaded, cfg);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn autostart_defaults_on_and_is_always_present_in_saved_config() {
+        // Shipping default: autostart is on, so a freshly installed plugin
+        // keeps a watcher running without the user opting in - the whole point
+        // is to avoid the silent "I thought it was working" failure mode.
+        assert!(Config::default().autostart);
+
+        let path = tmp_path("autostart_present.json");
+        let (_cfg, _) = Config::ensure_bootstrapped(&path);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("\"autostart\": true"),
+            "autostart must be written to a fresh config for discoverability: {raw}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn autostart_false_round_trips() {
+        let path = tmp_path("autostart_off.json");
+        let cfg = Config {
+            autostart: false,
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let (loaded, err) = Config::load(&path);
+        assert!(err.is_none());
+        assert!(!loaded.autostart);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_bool_recognizes_common_forms_and_rejects_the_rest() {
+        for on in ["1", "true", "TRUE", "Yes", " on "] {
+            assert_eq!(parse_bool(on), Some(true), "{on:?} should parse true");
+        }
+        for off in ["0", "false", "No", "OFF"] {
+            assert_eq!(parse_bool(off), Some(false), "{off:?} should parse false");
+        }
+        for junk in ["", "maybe", "2", "enabled"] {
+            assert_eq!(parse_bool(junk), None, "{junk:?} should be unrecognized");
+        }
+    }
+
+    #[test]
+    fn autostart_env_var_overrides_config_but_junk_falls_through() {
+        // All env manipulation is confined to this single test (no other test
+        // touches HERDR_WAKEUP_AUTOSTART) so it stays correct under the default
+        // parallel test runner.
+        const K: &str = "HERDR_WAKEUP_AUTOSTART";
+        let on = Config {
+            autostart: true,
+            ..Config::default()
+        };
+        let off = Config {
+            autostart: false,
+            ..Config::default()
+        };
+
+        std::env::remove_var(K);
+        assert!(on.autostart_enabled(), "no env -> config decides (on)");
+        assert!(!off.autostart_enabled(), "no env -> config decides (off)");
+
+        std::env::set_var(K, "0");
+        assert!(!on.autostart_enabled(), "env 0 overrides config on");
+        std::env::set_var(K, "1");
+        assert!(off.autostart_enabled(), "env 1 overrides config off");
+
+        std::env::set_var(K, "nonsense");
+        assert!(
+            on.autostart_enabled(),
+            "junk env falls through to config on"
+        );
+        assert!(
+            !off.autostart_enabled(),
+            "junk env falls through to config off"
+        );
+
+        std::env::remove_var(K);
     }
 
     #[test]

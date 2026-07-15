@@ -1,14 +1,40 @@
 #!/usr/bin/env bash
 # Action: start the keep-awake watcher in the background (no pane).
+#
+# Usage:
+#   start          Unconditionally start a watcher (the manual action).
+#   start --auto   Autostart path fired by the [[events]] hooks in
+#                  herdr-plugin.toml. Starts a watcher only when autostart is
+#                  enabled (config.json `autostart`, overridable by the
+#                  HERDR_WAKEUP_AUTOSTART env var), and stays quiet and cheap
+#                  when one is already running so high-frequency events like
+#                  pane.focused cost almost nothing and never fail the handler.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$DIR/lib.sh"
-resolve_bins
 
-if pid="$(watcher_pid)"; then
-  echo "herdr-wakeup watcher already running (pid $pid)"
-  exit 0
+auto=0
+case "${1:-}" in
+  --auto) auto=1 ;;
+  "") ;;
+  *) echo "usage: start [--auto]" >&2; exit 2 ;;
+esac
+
+if [ "$auto" = 1 ]; then
+  # Never let an event handler fail the caller: a missing binary or disabled
+  # autostart is just "nothing to do", not an error.
+  resolve_bins || exit 0
+  # Fast path: already running -> done. Keeps repeated events near-free.
+  watcher_pid >/dev/null 2>&1 && exit 0
+  # Gate: only autostart when the config/env decision says so.
+  "$WAKEUP_HERDR" autostart-decision >/dev/null 2>&1 || exit 0
+else
+  resolve_bins
+  if pid="$(watcher_pid)"; then
+    echo "herdr-wakeup watcher already running (pid $pid)"
+    exit 0
+  fi
 fi
 
 log="$(logfile)"

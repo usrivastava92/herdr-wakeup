@@ -22,17 +22,20 @@ Install the pinned release:
 herdr plugin install usrivastava92/herdr-wakeup/plugin --ref v0.1.0
 ```
 
-Installation builds, registers, and enables the plugin, but it does not start the background watcher.
-Start it explicitly:
-
-```bash
-herdr plugin action invoke start --plugin herdr-wakeup
-```
+Installation builds, registers, and enables the plugin.
+Autostart is on by default, so a watcher comes up on its own the next time Herdr pane or tab activity occurs - you do not need to start anything by hand.
+See [Autostart](#autostart) to turn it off or understand how it works.
 
 Confirm that it is running:
 
 ```bash
 herdr plugin action invoke status --plugin herdr-wakeup
+```
+
+To start a watcher immediately in the current session rather than waiting for the next Herdr event, invoke `start` explicitly:
+
+```bash
+herdr plugin action invoke start --plugin herdr-wakeup
 ```
 
 ## Requirements
@@ -63,7 +66,7 @@ herdr plugin install usrivastava92/herdr-wakeup/plugin --ref v0.1.0
 ```
 
 Herdr downloads the pinned source, runs the plugin build hook, registers the plugin, and enables its actions.
-Install does not launch a persistent process.
+Install itself does not launch a persistent process, but the plugin's event hooks then start one automatically on the next Herdr event (see [Autostart](#autostart)).
 
 ### 2. Start
 
@@ -74,8 +77,8 @@ herdr plugin action invoke start --plugin herdr-wakeup
 `start` launches one detached watcher for the current Herdr socket and session.
 The command is idempotent, so invoking it again does not create a duplicate watcher.
 
-The watcher does not start automatically after installation, login, machine restart, or an unexpected watcher exit.
-Invoke `start` again whenever a watcher is needed.
+You normally do not need to call `start`: with autostart on (the default) a watcher is launched for you, and a watcher that exits is restarted on the next Herdr event.
+Use `start` when you want a watcher up immediately without waiting for an event, or when you have turned autostart off.
 
 ### 3. Monitor agents
 
@@ -168,6 +171,31 @@ herdr plugin uninstall herdr-wakeup
 Stopping every session first ensures that no detached watcher or wake assertion remains active.
 To locate session-specific configuration, state, and logs before uninstalling, run `doctor` and remove those files manually if desired.
 
+## Autostart
+
+Autostart is on by default.
+You do not add anything to your shell profile and you do not install a login agent.
+
+Herdr has no dedicated session-start hook, but it does invoke plugin event commands on pane and tab lifecycle changes, and Herdr runs those commands itself - so they fire even when no watcher is running yet.
+The plugin registers such hooks (`pane.created`, `tab.created`, `pane.focused`) that run `start --auto`.
+That ensures a watcher is up: it is a cheap no-op when one is already running, and it starts one otherwise.
+Because `pane.focused` fires on ordinary interaction, a watcher that has exited is restarted on your next Herdr action rather than staying silently down.
+
+Whether `autostart` actually starts a watcher is decided in this order:
+
+1. The `HERDR_WAKEUP_AUTOSTART` environment variable, when set to a recognized value (`1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`), wins.
+2. Otherwise the `autostart` flag in `config.json` decides.
+3. With neither set, autostart is enabled.
+
+Turn it off persistently for a session by setting `"autostart": false` in that session's `config.json`, or per shell by exporting `HERDR_WAKEUP_AUTOSTART=0`.
+Only the event-driven `start --auto` path consults this setting; the manual `start` and `stop` actions are unaffected, so `start` always starts a watcher and `stop` always stops one.
+
+Inspect the current decision, including any environment override, with `doctor`:
+
+```bash
+herdr plugin action invoke doctor --plugin herdr-wakeup
+```
+
 ## Configuration
 
 Configuration is created automatically the first time `start`, `status`, `doctor`, `arm`, or `disarm` reads or changes it.
@@ -183,6 +211,7 @@ The default configuration is:
 {
   "allow_cli_fallback": false,
   "armed": true,
+  "autostart": true,
   "display": false,
   "notify": true,
   "start_grace_seconds": 5,
@@ -194,6 +223,7 @@ The default configuration is:
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `armed` | boolean | `true` | Allow the watcher to acquire and release wake assertions. |
+| `autostart` | boolean | `true` | Let the plugin's event hooks start a watcher automatically. Overridable per shell by the `HERDR_WAKEUP_AUTOSTART` environment variable. See [Autostart](#autostart). |
 | `display` | boolean | `false` | Keep the display awake in addition to the system. |
 | `start_grace_seconds` | integer | `5` | Require continuous matching activity for this long before acquiring an assertion. |
 | `stop_grace_seconds` | integer | `30` | Keep the assertion for this long after matching activity ends. |
@@ -201,13 +231,15 @@ The default configuration is:
 | `notify` | boolean | `true` | Show notifications when the assertion is acquired or released. |
 | `allow_cli_fallback` | boolean | `false` | Use `herdr agent list` when the Herdr socket is unreachable. |
 
-Only `armed` is hot-reloaded.
-After changing any other setting, restart the watcher:
+Among the settings a running watcher uses, only `armed` is hot-reloaded.
+After changing any other watcher setting, restart the watcher:
 
 ```bash
 herdr plugin action invoke stop --plugin herdr-wakeup
 herdr plugin action invoke start --plugin herdr-wakeup
 ```
+
+`autostart` is not a watcher runtime setting: it is read fresh each time an event fires, so a change takes effect on the next Herdr event without restarting anything.
 
 ## Safety and failure behavior
 
