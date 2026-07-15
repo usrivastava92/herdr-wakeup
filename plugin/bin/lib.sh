@@ -124,7 +124,9 @@ _lock_dir_owned_by_self() {
 _cleanup_lockdir_if_owned() {
   local d
   d="$1"
-  _lock_dir_owned_by_self "$d" && rm -rf "$d" 2>/dev/null || true
+  if _lock_dir_owned_by_self "$d"; then
+    rm -rf "$d" 2>/dev/null || true
+  fi
 }
 
 release_start_locks() {
